@@ -1,0 +1,645 @@
+{% extends "base.html" %}
+{% block title %}{{ collection.name }} — Qdrant Monitor{% endblock %}
+
+{% block content %}
+<!-- ── Breadcrumb ── -->
+<div class="flex items-center gap-2 text-sm mb-6">
+  <a href="/" class="text-[#4b5f82] hover:text-[#00e5a0] transition-colors">Collections</a>
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4b5f82" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+  <span class="font-mono text-white">{{ collection.name }}</span>
+</div>
+
+<!-- ── Header ── -->
+<div class="qd-card p-5 mb-6">
+  <div class="flex items-start justify-between flex-wrap gap-4">
+    <div>
+      <h1 class="font-display font-bold text-xl text-white tracking-tight">{{ collection.name }}</h1>
+      <div class="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-xs text-[#7b8fb5]">
+        {% for vc in collection.vec_configs %}
+        <span class="flex items-center gap-1.5">
+          <span class="w-1.5 h-1.5 rounded-full bg-[#38bdf8]"></span>
+          <span class="font-mono text-[#38bdf8]">{{ vc.name }}</span>
+          {{ vc.size }}d &middot; {{ vc.distance }}
+        </span>
+        {% endfor %}
+        {% for sc in collection.sparse_configs %}
+        <span class="flex items-center gap-1.5">
+          <span class="w-1.5 h-1.5 rounded-full bg-[#f59e0b]"></span>
+          <span class="font-mono text-[#f59e0b]">{{ sc.name }}</span>
+          sparse
+        </span>
+        {% endfor %}
+      </div>
+    </div>
+
+    {% if collection.status == 'green' %}
+    <span class="badge badge-green"><span class="w-1.5 h-1.5 rounded-full bg-[#4ade80]"></span>Ready</span>
+    {% elif collection.status == 'yellow' %}
+    <span class="badge badge-yellow"><span class="w-1.5 h-1.5 rounded-full bg-[#fbbf24]"></span>Indexing</span>
+    {% else %}
+    <span class="badge badge-red"><span class="w-1.5 h-1.5 rounded-full bg-[#f87171]"></span>{{ collection.status }}</span>
+    {% endif %}
+  </div>
+
+  <!-- Stats row -->
+  <div class="grid grid-cols-2 sm:grid-cols-5 gap-4 mt-5 pt-4 border-t border-[#1a2236]">
+    <div>
+      <div class="stat-number text-lg">{{ "{:,}".format(collection.points_count) }}</div>
+      <div class="stat-label">Points</div>
+    </div>
+    <div>
+      <div class="stat-number text-lg">{{ "{:,}".format(collection.indexed_vectors_count) }}</div>
+      <div class="stat-label">Indexed Vectors</div>
+    </div>
+    <div>
+      <div class="stat-number text-lg {% if collection.index_pct == 100 %}text-[#4ade80]{% elif collection.index_pct < 50 %}text-[#f87171]{% else %}text-[#fbbf24]{% endif %}">{{ collection.index_pct }}%</div>
+      <div class="stat-label">Indexed</div>
+    </div>
+    <div>
+      <div class="stat-number text-lg">{{ collection.segments_count }}</div>
+      <div class="stat-label">Segments</div>
+    </div>
+    <div>
+      <div class="stat-number text-lg">{{ collection.shard_number }}</div>
+      <div class="stat-label">Shards</div>
+    </div>
+  </div>
+
+  <!-- Expandable config details -->
+  <details class="mt-4 pt-4 border-t border-[#1a2236] group">
+    <summary class="text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider cursor-pointer
+                     hover:text-[#00e5a0] transition-colors select-none flex items-center gap-1.5">
+      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+           class="transition-transform group-open:rotate-90">
+        <polyline points="9 18 15 12 9 6"/>
+      </svg>
+      Configuration Details
+    </summary>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-3">
+
+      <!-- HNSW config -->
+      <div class="bg-[#0a0e17] rounded-lg p-3">
+        <h4 class="text-[0.625rem] text-[#38bdf8] uppercase tracking-wider mb-2 font-medium">HNSW Index</h4>
+        <div class="space-y-1 text-xs">
+          {% for k, v in collection.hnsw_config.items() %}
+          <div class="flex justify-between">
+            <span class="text-[#4b5f82]">{{ k }}</span>
+            <span class="font-mono text-[#94a8c8]">{{ v }}</span>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <!-- Optimizer config -->
+      <div class="bg-[#0a0e17] rounded-lg p-3">
+        <h4 class="text-[0.625rem] text-[#f59e0b] uppercase tracking-wider mb-2 font-medium">Optimizer</h4>
+        <div class="space-y-1 text-xs">
+          {% for k, v in collection.optimizer_config.items() %}
+          <div class="flex justify-between">
+            <span class="text-[#4b5f82]">{{ k }}</span>
+            <span class="font-mono text-[#94a8c8]">{{ v }}</span>
+          </div>
+          {% endfor %}
+          <div class="flex justify-between">
+            <span class="text-[#4b5f82]">on_disk_payload</span>
+            <span class="font-mono text-[#94a8c8]">{{ collection.on_disk_payload }}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- WAL + Payload schema -->
+      <div class="bg-[#0a0e17] rounded-lg p-3">
+        <h4 class="text-[0.625rem] text-[#a78bfa] uppercase tracking-wider mb-2 font-medium">WAL</h4>
+        <div class="space-y-1 text-xs mb-3">
+          {% for k, v in collection.wal_config.items() %}
+          <div class="flex justify-between">
+            <span class="text-[#4b5f82]">{{ k }}</span>
+            <span class="font-mono text-[#94a8c8]">{{ v }}</span>
+          </div>
+          {% endfor %}
+        </div>
+        {% if collection.payload_schema %}
+        <h4 class="text-[0.625rem] text-[#00e5a0] uppercase tracking-wider mb-2 font-medium">Payload Indexes</h4>
+        <div class="space-y-1 text-xs">
+          {% for pi in collection.payload_schema %}
+          <div class="flex justify-between">
+            <span class="font-mono text-[#94a8c8]">{{ pi.field }}</span>
+            <span class="text-[#4b5f82]">{{ pi.type }} ({{ "{:,}".format(pi.points) }})</span>
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </details>
+</div>
+
+<!-- ── Tabs ── -->
+<div class="border-b border-[#1a2236] mb-6 flex gap-1 overflow-x-auto">
+  <button class="qd-tab tab-active" id="tab-btn-browse"
+          onclick="switchTab('browse')">Browse</button>
+  <button class="qd-tab" id="tab-btn-search-id"
+          onclick="switchTab('search-id')">By ID</button>
+  <button class="qd-tab" id="tab-btn-search-text"
+          onclick="switchTab('search-text')">By Text</button>
+  <button class="qd-tab" id="tab-btn-vectorspace"
+          onclick="switchTab('vectorspace')">Vector Space</button>
+</div>
+
+<!-- ── Tab: Browse ── -->
+<div id="tab-browse" class="tab-panel">
+  <!-- Controls -->
+  <div class="flex flex-wrap items-end gap-3 mb-4">
+    <div>
+      <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Rows</label>
+      <select id="browse-limit" class="qd-select text-xs py-1.5" onchange="loadBrowse()">
+        <option value="10">10</option>
+        <option value="20" selected>20</option>
+        <option value="50">50</option>
+        <option value="100">100</option>
+      </select>
+    </div>
+    <div>
+      <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Filter field</label>
+      <select id="browse-filter-field" class="qd-select text-xs py-1.5">
+        <option value="">—</option>
+        {% for f in payload_fields %}
+        <option value="{{ f }}">{{ f }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Filter value</label>
+      <input id="browse-filter-value" class="qd-input text-xs py-1.5 w-44" placeholder="exact match">
+    </div>
+    <button class="qd-btn text-xs py-1.5" onclick="loadBrowse()">Load</button>
+  </div>
+
+  <!-- Table content (loaded via HTMX) -->
+  <div id="browse-content"
+       hx-get="/api/{{ collection.name }}/browse?limit=20"
+       hx-trigger="load"
+       hx-swap="innerHTML">
+    <div class="flex justify-center py-16">
+      <div class="qd-spinner"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Tab: Search by ID ── -->
+<div id="tab-search-id" class="tab-panel hidden">
+  <form hx-get="/api/{{ collection.name }}/search-id"
+        hx-target="#search-id-results"
+        hx-swap="innerHTML"
+        hx-indicator="#search-id-spinner"
+        class="flex flex-wrap items-end gap-3 mb-5">
+    <div>
+      <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Point ID</label>
+      <input name="point_id" class="qd-input text-xs py-1.5 w-72" placeholder="integer or UUID">
+    </div>
+    <div class="flex items-center gap-2">
+      <input type="checkbox" name="with_vectors" value="true" id="chk-vectors"
+             class="w-3.5 h-3.5 rounded bg-[#0e1421] border-[#1a2236] accent-[#00e5a0]">
+      <label for="chk-vectors" class="text-xs text-[#7b8fb5] cursor-pointer">Include vectors</label>
+    </div>
+    <button type="submit" class="qd-btn text-xs py-1.5">Fetch</button>
+    <div id="search-id-spinner" class="htmx-indicator"><div class="qd-spinner"></div></div>
+  </form>
+  <div id="search-id-results"></div>
+</div>
+
+<!-- ── Tab: Search by Text ── -->
+<div id="tab-search-text" class="tab-panel hidden">
+  <form hx-get="/api/{{ collection.name }}/search-text"
+        hx-target="#search-text-results"
+        hx-swap="innerHTML"
+        hx-indicator="#search-text-spinner"
+        class="flex flex-wrap items-end gap-3 mb-5">
+    <div class="flex-1 min-w-[200px] max-w-md">
+      <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Query</label>
+      <input name="query" class="qd-input text-xs py-1.5 w-full" placeholder="search text...">
+    </div>
+    <div>
+      <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">In field</label>
+      <select name="field" class="qd-select text-xs py-1.5">
+        {% for f in payload_fields %}
+        <option value="{{ f }}" {{ 'selected' if f == 'text' else '' }}>{{ f }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Limit</label>
+      <select name="limit" class="qd-select text-xs py-1.5">
+        <option value="5">5</option>
+        <option value="10" selected>10</option>
+        <option value="25">25</option>
+        <option value="50">50</option>
+      </select>
+    </div>
+    <button type="submit" class="qd-btn text-xs py-1.5">Search</button>
+    <div id="search-text-spinner" class="htmx-indicator"><div class="qd-spinner"></div></div>
+  </form>
+  <div id="search-text-results"></div>
+</div>
+
+<!-- ── Tab: Vector Space ── -->
+<div id="tab-vectorspace" class="tab-panel hidden">
+
+  <!-- Sub-mode toggle -->
+  <div class="flex gap-2 mb-5">
+    <button onclick="showVizMode('hnsw')" id="viz-mode-hnsw"
+            class="qd-btn-ghost text-xs py-1.5 border-[#00e5a0] text-[#00e5a0]">HNSW Graph</button>
+    <button onclick="showVizMode('pca')" id="viz-mode-pca"
+            class="qd-btn-ghost text-xs py-1.5">PCA Projection</button>
+  </div>
+
+  <!-- ── HNSW Graph panel ── -->
+  <div id="viz-hnsw-panel">
+    <div class="flex flex-wrap items-end gap-3 mb-4">
+      <div>
+        <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Max nodes</label>
+        <select id="hnsw-max-nodes" class="qd-select text-xs py-1.5">
+          <option value="100">100</option>
+          <option value="200" selected>200</option>
+          <option value="400">400</option>
+        </select>
+      </div>
+      <button class="qd-btn text-xs py-1.5" onclick="generateHnsw()" id="hnsw-btn">Generate</button>
+      <div id="hnsw-spinner" class="hidden"><div class="qd-spinner"></div></div>
+    </div>
+
+    <!-- Config info cards (populated by JS) -->
+    <div id="hnsw-config" class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4"></div>
+
+    <!-- Legend (populated by JS) -->
+    <div id="hnsw-legend" class="flex flex-wrap gap-3 mb-4"></div>
+
+    <p class="text-[0.6875rem] text-[#4b5f82] mb-3">
+      Approximate HNSW graph structure derived from collection config.
+      Nodes sized by layer (larger = higher layer). Edges show M-nearest-neighbor connections.
+    </p>
+    <div id="hnsw-graph" class="qd-card relative" style="height: 560px; overflow: hidden;"></div>
+  </div>
+
+  <!-- ── PCA panel ── -->
+  <div id="viz-pca-panel" class="hidden">
+    <div class="flex flex-wrap items-end gap-3 mb-4">
+      <div>
+        <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Vector</label>
+        <select id="viz-vector" class="qd-select text-xs py-1.5">
+          {% for vc in collection.vec_configs %}
+          <option value="{{ vc.name }}">{{ vc.name }} ({{ vc.size }}d)</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Sample</label>
+        <select id="viz-sample" class="qd-select text-xs py-1.5">
+          <option value="100">100</option>
+          <option value="300" selected>300</option>
+          <option value="500">500</option>
+          <option value="1000">1000</option>
+        </select>
+      </div>
+      <div>
+        <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Color by</label>
+        <select id="viz-color" class="qd-select text-xs py-1.5">
+          <option value="">None</option>
+          {% for f in payload_fields %}
+          <option value="{{ f }}" {{ 'selected' if f == 'doc_type' or f == 'ticker' else '' }}>{{ f }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <button class="qd-btn text-xs py-1.5" onclick="generateViz()" id="viz-btn">Generate</button>
+      <div id="viz-spinner" class="hidden"><div class="qd-spinner"></div></div>
+    </div>
+    <p class="text-[0.6875rem] text-[#4b5f82] mb-3">
+      PCA projection of actual dense vectors onto 2D. Points close together have similar embeddings.
+    </p>
+    <div id="vector-plot" class="qd-card" style="height: 560px; overflow: hidden;"></div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+function switchTab(name) {
+  document.querySelectorAll('.tab-panel').forEach(el => el.classList.add('hidden'));
+  document.getElementById('tab-' + name).classList.remove('hidden');
+  document.querySelectorAll('.qd-tab').forEach(el => el.classList.remove('tab-active'));
+  document.getElementById('tab-btn-' + name).classList.add('tab-active');
+}
+
+function loadBrowse(offset) {
+  const limit = document.getElementById('browse-limit').value;
+  const field = document.getElementById('browse-filter-field').value;
+  const value = document.getElementById('browse-filter-value').value;
+  let url = '/api/{{ collection.name }}/browse?limit=' + limit;
+  if (field) url += '&filter_field=' + encodeURIComponent(field);
+  if (value) url += '&filter_value=' + encodeURIComponent(value);
+  if (offset) url += '&offset=' + encodeURIComponent(offset);
+  htmx.ajax('GET', url, {target: '#browse-content', swap: 'innerHTML'});
+}
+
+function toggleDetail(btn) {
+  const row = btn.closest('tr').nextElementSibling;
+  row.classList.toggle('hidden');
+  btn.textContent = row.classList.contains('hidden') ? '+' : '\u2212';
+}
+
+function showVizMode(mode) {
+  document.getElementById('viz-hnsw-panel').classList.toggle('hidden', mode !== 'hnsw');
+  document.getElementById('viz-pca-panel').classList.toggle('hidden', mode !== 'pca');
+  const hn = document.getElementById('viz-mode-hnsw');
+  const pn = document.getElementById('viz-mode-pca');
+  if (mode === 'hnsw') {
+    hn.classList.add('border-[#00e5a0]', 'text-[#00e5a0]');
+    pn.classList.remove('border-[#00e5a0]', 'text-[#00e5a0]');
+  } else {
+    pn.classList.add('border-[#00e5a0]', 'text-[#00e5a0]');
+    hn.classList.remove('border-[#00e5a0]', 'text-[#00e5a0]');
+  }
+}
+
+const PALETTE = [
+  '#00e5a0', '#38bdf8', '#f59e0b', '#ef4444', '#a78bfa',
+  '#fb923c', '#4ade80', '#f472b6', '#22d3ee', '#fbbf24',
+  '#818cf8', '#34d399', '#fb7185', '#60a5fa', '#c084fc'
+];
+
+async function generateHnsw() {
+  const maxNodes = document.getElementById('hnsw-max-nodes').value;
+  const btn = document.getElementById('hnsw-btn');
+  const spinner = document.getElementById('hnsw-spinner');
+  btn.disabled = true; btn.textContent = 'Loading\u2026'; spinner.classList.remove('hidden');
+
+  try {
+    const resp = await fetch(`/api/{{ collection.name }}/hnsw-graph?max_nodes=${maxNodes}`);
+    const data = await resp.json();
+    if (data.error) {
+      document.getElementById('hnsw-graph').innerHTML =
+        `<p class="p-8 text-center text-[#f87171] text-sm">${data.error}</p>`;
+      return;
+    }
+
+    // Render config cards
+    const cfg = data.config;
+    document.getElementById('hnsw-config').innerHTML = `
+      <div class="qd-card p-3 text-center">
+        <div class="stat-number text-base">${cfg.m}</div>
+        <div class="stat-label">m</div>
+      </div>
+      <div class="qd-card p-3 text-center">
+        <div class="stat-number text-base">${cfg.payload_m}</div>
+        <div class="stat-label">payload_m</div>
+      </div>
+      <div class="qd-card p-3 text-center">
+        <div class="stat-number text-base">${cfg.ef_construct}</div>
+        <div class="stat-label">ef_construct</div>
+      </div>
+      <div class="qd-card p-3 text-center">
+        <div class="stat-number text-base">${cfg.layers}</div>
+        <div class="stat-label">est. layers</div>
+      </div>
+    `;
+
+    // Legend
+    const sgNames = data.subgraphs.map(s => s.name);
+    document.getElementById('hnsw-legend').innerHTML = sgNames.map((n, i) =>
+      `<span class="flex items-center gap-1.5 text-xs">
+        <span class="w-2.5 h-2.5 rounded-full" style="background:${PALETTE[i % PALETTE.length]}"></span>
+        <span class="text-[#7b8fb5]">${n}</span>
+        <span class="text-[#4b5f82]">(${data.subgraphs[i].count})</span>
+      </span>`
+    ).join('');
+
+    // D3 force-directed graph
+    const container = document.getElementById('hnsw-graph');
+    container.innerHTML = '';
+    const width = container.clientWidth;
+    const height = container.clientHeight;
+
+    const svg = d3.select(container).append('svg')
+      .attr('width', width).attr('height', height)
+      .style('background', '#0a0e17');
+
+    const g = svg.append('g');
+
+    // Zoom
+    svg.call(d3.zoom().scaleExtent([0.2, 5]).on('zoom', (e) => {
+      g.attr('transform', e.transform);
+    }));
+
+    // Color map
+    const colorMap = {};
+    sgNames.forEach((n, i) => { colorMap[n] = PALETTE[i % PALETTE.length]; });
+
+    // Layer sizes
+    const maxLayer = Math.max(...data.nodes.map(n => n.layer), 0);
+    const sizeScale = (layer) => 2.5 + layer * 2.5;
+    const opacityScale = (layer) => 0.15 + (layer / Math.max(maxLayer, 1)) * 0.6;
+
+    // Links
+    const linkData = data.links.map(l => ({
+      source: data.nodes.findIndex(n => n.id === l.source),
+      target: data.nodes.findIndex(n => n.id === l.target),
+      layer: l.layer,
+    })).filter(l => l.source >= 0 && l.target >= 0);
+
+    // Simulation
+    const sim = d3.forceSimulation(data.nodes)
+      .force('link', d3.forceLink(linkData).distance(18).strength(0.3))
+      .force('charge', d3.forceManyBody().strength(-12))
+      .force('center', d3.forceCenter(width / 2, height / 2))
+      .force('collision', d3.forceCollide().radius(d => sizeScale(d.layer) + 1));
+
+    // Separate subgraphs if multiple
+    if (sgNames.length > 1) {
+      const sgCenters = {};
+      sgNames.forEach((n, i) => {
+        const a = (2 * Math.PI * i) / sgNames.length;
+        sgCenters[n] = { x: width/2 + Math.cos(a) * width * 0.25, y: height/2 + Math.sin(a) * height * 0.25 };
+      });
+      sim.force('x', d3.forceX(d => sgCenters[d.subgraph].x).strength(0.15));
+      sim.force('y', d3.forceY(d => sgCenters[d.subgraph].y).strength(0.15));
+    }
+
+    // Draw links
+    const link = g.append('g').selectAll('line').data(linkData).join('line')
+      .attr('stroke', d => {
+        const srcNode = data.nodes[d.source.index !== undefined ? d.source.index : d.source];
+        return srcNode ? colorMap[srcNode.subgraph] || '#1e293b' : '#1e293b';
+      })
+      .attr('stroke-opacity', d => opacityScale(d.layer) * 0.4)
+      .attr('stroke-width', d => 0.3 + d.layer * 0.4);
+
+    // Draw nodes
+    const node = g.append('g').selectAll('circle').data(data.nodes).join('circle')
+      .attr('r', d => sizeScale(d.layer))
+      .attr('fill', d => colorMap[d.subgraph] || '#00e5a0')
+      .attr('fill-opacity', d => 0.5 + (d.layer / Math.max(maxLayer, 1)) * 0.5)
+      .attr('stroke', d => d.layer >= maxLayer && maxLayer > 0 ? '#fff' : 'none')
+      .attr('stroke-width', d => d.layer >= maxLayer && maxLayer > 0 ? 1.5 : 0)
+      .call(d3.drag()
+        .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+        .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
+        .on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
+      );
+
+    // Tooltip
+    const tooltip = d3.select(container).append('div')
+      .style('position', 'absolute').style('pointer-events', 'none')
+      .style('background', '#151d2e').style('border', '1px solid #1e293b')
+      .style('border-radius', '6px').style('padding', '6px 10px')
+      .style('font-size', '11px').style('font-family', 'Fira Code, monospace')
+      .style('color', '#d0dce8').style('opacity', 0).style('z-index', 10);
+
+    node.on('mouseover', (e, d) => {
+      tooltip.style('opacity', 1)
+        .html(`<span style="color:${colorMap[d.subgraph]}">${d.subgraph}</span><br>Layer ${d.layer}${d.layer >= maxLayer && maxLayer > 0 ? ' (entry)' : ''}`)
+        .style('left', (e.offsetX + 12) + 'px').style('top', (e.offsetY - 10) + 'px');
+    }).on('mouseout', () => { tooltip.style('opacity', 0); });
+
+    // Subgraph labels
+    if (sgNames.length > 1) {
+      sim.on('tick', () => {
+        link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+            .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+        node.attr('cx', d => d.x).attr('cy', d => d.y);
+      });
+    } else {
+      sim.on('tick', () => {
+        link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+            .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+        node.attr('cx', d => d.x).attr('cy', d => d.y);
+      });
+    }
+
+  } catch (err) {
+    document.getElementById('hnsw-graph').innerHTML =
+      `<p class="p-8 text-center text-[#f87171] text-sm">${err.message}</p>`;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Generate'; spinner.classList.add('hidden');
+  }
+}
+
+async function generateViz() {
+  const vectorName = document.getElementById('viz-vector').value;
+  const sample = document.getElementById('viz-sample').value;
+  const colorField = document.getElementById('viz-color').value;
+  const btn = document.getElementById('viz-btn');
+  const spinner = document.getElementById('viz-spinner');
+
+  btn.disabled = true;
+  btn.textContent = 'Loading\u2026';
+  spinner.classList.remove('hidden');
+
+  try {
+    const url = `/api/{{ collection.name }}/vectors-2d?vector_name=${encodeURIComponent(vectorName)}&sample=${sample}&color_field=${encodeURIComponent(colorField)}`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+
+    if (data.error) {
+      document.getElementById('vector-plot').innerHTML =
+        `<p class="p-8 text-center text-[#f87171] text-sm">${data.error}</p>`;
+      return;
+    }
+
+    // Group by category for colored traces
+    const rawCategories = [...new Set(data.categories)].filter(c => c !== '');
+    const palette = PALETTE;
+
+    // Count per category, sort by frequency, keep top 14, rest become "other"
+    const counts = {};
+    data.categories.forEach(c => { counts[c] = (counts[c] || 0) + 1; });
+    const sorted = rawCategories.sort((a, b) => (counts[b] || 0) - (counts[a] || 0));
+    const MAX_CATS = 14;
+    const topCats = sorted.slice(0, MAX_CATS);
+    const hasOther = sorted.length > MAX_CATS;
+    // Remap: top cats keep their name, rest become "other"
+    const mapped = data.categories.map(c => (!c || (hasOther && !topCats.includes(c))) ? '__other__' : c);
+    const categories = [...new Set(mapped)].filter(c => c !== '__other__');
+    if (hasOther || mapped.includes('__other__')) categories.push('__other__');
+
+    let traces;
+    if (colorField && categories.length > 1) {
+      traces = categories.map((cat, i) => {
+        const indices = mapped.map((c, j) => c === cat ? j : -1).filter(j => j >= 0);
+        return {
+          x: indices.map(j => data.x[j]),
+          y: indices.map(j => data.y[j]),
+          text: indices.map(j => data.labels[j]),
+          name: cat === '__other__' ? `other (${sorted.length - MAX_CATS})` : (cat || '(empty)'),
+          mode: 'markers',
+          type: 'scattergl',
+          hoverinfo: 'text+name',
+          marker: {
+            color: palette[i % palette.length],
+            size: 6,
+            opacity: 0.75,
+            line: { width: 0.5, color: 'rgba(0,0,0,0.3)' }
+          }
+        };
+      });
+    } else {
+      traces = [{
+        x: data.x, y: data.y,
+        text: data.labels,
+        mode: 'markers',
+        type: 'scattergl',
+        hoverinfo: 'text',
+        marker: {
+          color: '#00e5a0',
+          size: 6,
+          opacity: 0.7,
+          line: { width: 0.5, color: 'rgba(0,229,160,0.3)' }
+        }
+      }];
+    }
+
+    const layout = {
+      paper_bgcolor: '#121a2a',
+      plot_bgcolor: '#0a0e17',
+      font: { family: 'DM Sans, sans-serif', color: '#7b8fb5', size: 11 },
+      margin: { l: 40, r: 20, t: 30, b: 40 },
+      xaxis: {
+        title: 'PC1', gridcolor: '#1a2236', zerolinecolor: '#1e293b',
+        gridwidth: 1, tickfont: { family: 'Fira Code, monospace', size: 9 }
+      },
+      yaxis: {
+        title: 'PC2', gridcolor: '#1a2236', zerolinecolor: '#1e293b',
+        gridwidth: 1, tickfont: { family: 'Fira Code, monospace', size: 9 }
+      },
+      legend: {
+        bgcolor: 'rgba(14,20,33,0.8)', bordercolor: '#1a2236', borderwidth: 1,
+        font: { size: 10 }
+      },
+      hoverlabel: {
+        bgcolor: '#151d2e', bordercolor: '#00e5a0',
+        font: { family: 'Fira Code, monospace', size: 11, color: '#d0dce8' }
+      },
+      title: {
+        text: `${data.count} vectors \u2022 PCA 2D`,
+        font: { size: 12, color: '#4b5f82' },
+        x: 0.01, xanchor: 'left'
+      }
+    };
+
+    Plotly.newPlot('vector-plot', traces, layout, {
+      responsive: true,
+      displayModeBar: true,
+      modeBarButtonsToRemove: ['sendDataToCloud', 'autoScale2d'],
+      displaylogo: false
+    });
+  } catch (err) {
+    document.getElementById('vector-plot').innerHTML =
+      `<p class="p-8 text-center text-[#f87171] text-sm">${err.message}</p>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Generate';
+    spinner.classList.add('hidden');
+  }
+}
+</script>
+{% endblock %}

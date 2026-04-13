@@ -1,0 +1,60 @@
+{% if error %}
+<div class="qd-card p-5">
+  <div class="flex items-center gap-2 text-[#f87171]">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+      <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+    </svg>
+    <span class="text-sm">{{ error }}</span>
+  </div>
+</div>
+
+{% elif results | length == 0 and query %}
+<div class="qd-card p-8 text-center">
+  <p class="text-[#4b5f82] text-sm">
+    No matches for "<span class="text-white">{{ query }}</span>" in field
+    <span class="font-mono text-[#38bdf8]">{{ field }}</span>
+  </p>
+  <p class="text-[#2a3550] text-xs mt-1">Scanned {{ "{:,}".format(total_scanned) }} points</p>
+</div>
+
+{% elif results | length > 0 %}
+<div class="mb-3 text-xs text-[#4b5f82]">
+  {{ results | length }} match{{ 'es' if results | length != 1 else '' }}
+  &middot; scanned {{ "{:,}".format(total_scanned) }} points
+</div>
+
+<div class="space-y-3">
+  {% for r in results %}
+  <div class="qd-card p-4">
+    <!-- Header -->
+    <div class="flex items-center gap-3 mb-3">
+      <span class="font-mono text-xs text-[#38bdf8]">{{ r.id }}</span>
+      {% if r.payload.get('ticker') %}
+      <span class="badge badge-green text-[0.625rem]">{{ r.payload.ticker }}</span>
+      {% endif %}
+      {% if r.payload.get('doc_type') %}
+      <span class="badge badge-blue text-[0.625rem]">{{ r.payload.doc_type }}</span>
+      {% endif %}
+    </div>
+
+    <!-- Matched text snippet -->
+    <div class="bg-[#080c14] rounded-lg p-3 mb-3 text-xs text-[#94a8c8] leading-relaxed max-h-32 overflow-y-auto">
+      {{ r.matched_value | trunc(400) }}
+    </div>
+
+    <!-- Expandable full payload -->
+    <details class="group">
+      <summary class="text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider cursor-pointer
+                       hover:text-[#00e5a0] transition-colors select-none flex items-center gap-1.5">
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+             class="transition-transform group-open:rotate-90">
+          <polyline points="9 18 15 12 9 6"/>
+        </svg>
+        Full payload
+      </summary>
+      <pre class="json-block mt-2">{{ r.payload_json }}</pre>
+    </details>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}

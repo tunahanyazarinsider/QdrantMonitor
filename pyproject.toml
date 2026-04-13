@@ -1,0 +1,15 @@
+[project]
+name = "qdrant-monitor"
+version = "0.1.0"
+description = "Airflow-style dashboard for monitoring and querying Qdrant collections"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "qdrant-client>=1.17.1",
+    "jinja2>=3.1.6",
+    "python-multipart>=0.0.20",
+]
+
+[project.scripts]
+qdrant-monitor = "app.main:run"

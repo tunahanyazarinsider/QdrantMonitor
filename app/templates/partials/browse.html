@@ -1,0 +1,79 @@
+{% if rows | length == 0 %}
+<div class="qd-card p-8 text-center">
+  <p class="text-[#4b5f82] text-sm">No points found</p>
+</div>
+{% else %}
+<div class="qd-card overflow-hidden">
+  <div class="overflow-x-auto">
+    <table class="qd-table">
+      <thead>
+        <tr>
+          <th class="w-8"></th>
+          <th>ID</th>
+          {% for col in columns[:8] %}
+          <th>{{ col }}</th>
+          {% endfor %}
+          {% if columns | length > 8 %}
+          <th class="text-center">+{{ columns | length - 8 }}</th>
+          {% endif %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <!-- Data row -->
+        <tr class="cursor-pointer hover:bg-[rgba(0,229,160,0.04)]">
+          <td class="text-center">
+            <button onclick="toggleDetail(this)"
+                    class="w-5 h-5 rounded bg-[#0e1421] border border-[#1a2236] text-[#4b5f82]
+                           hover:border-[#00e5a0] hover:text-[#00e5a0] text-xs font-mono
+                           transition-colors leading-none">+</button>
+          </td>
+          <td class="font-mono text-xs text-[#38bdf8]">{{ row.id }}</td>
+          {% for col in columns[:8] %}
+          <td class="text-xs">
+            {% if row.payload.get(col) is not none %}
+              {{ row.payload[col] | trunc }}
+            {% else %}
+              <span class="text-[#2a3550]">null</span>
+            {% endif %}
+          </td>
+          {% endfor %}
+          {% if columns | length > 8 %}
+          <td class="text-xs text-[#4b5f82] text-center">&hellip;</td>
+          {% endif %}
+        </tr>
+        <!-- Detail row (hidden) -->
+        <tr class="hidden detail-row">
+          <td colspan="{{ columns[:8] | length + 2 + (1 if columns | length > 8 else 0) }}">
+            <div class="detail-content p-4">
+              <pre class="json-block">{{ row.payload_json }}</pre>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Pagination -->
+<div class="flex items-center justify-between mt-4">
+  <p class="text-xs text-[#4b5f82]">
+    Showing {{ rows | length }} point{{ 's' if rows | length != 1 else '' }}
+  </p>
+  <div class="flex gap-2">
+    {% if current_offset %}
+    <button class="qd-btn-ghost text-xs py-1.5"
+            onclick="loadBrowse()">
+      &larr; First
+    </button>
+    {% endif %}
+    {% if next_offset %}
+    <button class="qd-btn-ghost text-xs py-1.5"
+            onclick="loadBrowse('{{ next_offset }}')">
+      Next &rarr;
+    </button>
+    {% endif %}
+  </div>
+</div>
+{% endif %}

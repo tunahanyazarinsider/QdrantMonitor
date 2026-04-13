@@ -1,0 +1,373 @@
+/* ── Qdrant Monitor — Industrial Terminal Aesthetic ── */
+
+:root {
+  --bg-deep: #060a12;
+  --bg-primary: #080c14;
+  --bg-surface: #0e1421;
+  --bg-card: #121a2a;
+  --bg-card-hover: #182035;
+  --accent: #00e5a0;
+  --accent-glow: rgba(0, 229, 160, 0.15);
+  --accent-glow-strong: rgba(0, 229, 160, 0.3);
+  --cyan: #38bdf8;
+  --amber: #f59e0b;
+  --red: #ef4444;
+  --green: #22c55e;
+  --border: #1a2236;
+  --border-light: #243049;
+  --text-dim: #4b5f82;
+  --text-mid: #7b8fb5;
+  --text-body: #94a8c8;
+  --text-bright: #d0dce8;
+}
+
+/* ── Dot grid background ── */
+.dot-grid {
+  background-color: var(--bg-deep);
+  background-image:
+    radial-gradient(circle, rgba(0, 229, 160, 0.035) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+/* ── Scanline overlay ── */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 3px,
+    rgba(0, 0, 0, 0.015) 3px,
+    rgba(0, 0, 0, 0.015) 6px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-light);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
+}
+
+/* ── Status pulse ── */
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5); }
+  50% { box-shadow: 0 0 6px 3px rgba(34, 197, 94, 0.25); }
+}
+.status-pulse-green {
+  animation: pulse-glow 2.5s ease-in-out infinite;
+}
+
+@keyframes pulse-red {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
+  50% { box-shadow: 0 0 6px 3px rgba(239, 68, 68, 0.25); }
+}
+.status-pulse-red {
+  animation: pulse-red 2s ease-in-out infinite;
+}
+
+/* ── Card ── */
+.qd-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.qd-card:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--accent);
+  box-shadow:
+    0 0 20px var(--accent-glow),
+    0 0 60px rgba(0, 229, 160, 0.04);
+  transform: translateY(-2px);
+}
+
+/* ── Staggered entry ── */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.card-enter {
+  animation: fade-up 0.45s ease-out both;
+}
+
+/* ── Tab bar ── */
+.qd-tab {
+  position: relative;
+  padding: 10px 20px;
+  font-weight: 500;
+  color: var(--text-dim);
+  border-bottom: 2px solid transparent;
+  transition: color 0.2s, border-color 0.2s;
+  cursor: pointer;
+  background: none;
+  border-top: none;
+  border-left: none;
+  border-right: none;
+  font-family: inherit;
+  font-size: 0.875rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.qd-tab:hover {
+  color: var(--text-body);
+}
+.qd-tab.tab-active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.qd-tab.tab-active::after {
+  content: '';
+  position: absolute;
+  bottom: -1px;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, var(--accent), var(--cyan));
+  border-radius: 2px;
+}
+
+/* ── Data table ── */
+.qd-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.8125rem;
+}
+.qd-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-surface);
+  color: var(--text-dim);
+  font-weight: 500;
+  text-transform: uppercase;
+  font-size: 0.6875rem;
+  letter-spacing: 0.08em;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+.qd-table tbody tr {
+  transition: background 0.15s;
+}
+.qd-table tbody tr:hover {
+  background: rgba(0, 229, 160, 0.04);
+}
+.qd-table tbody td {
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(26, 34, 54, 0.5);
+  color: var(--text-body);
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qd-table tbody tr.detail-row td {
+  padding: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-deep);
+}
+
+/* ── Expandable detail ── */
+.detail-content {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+/* ── JSON display ── */
+.json-block {
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.75rem;
+  line-height: 1.7;
+  color: var(--text-body);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.json-block .key {
+  color: var(--cyan);
+}
+.json-block .str {
+  color: var(--accent);
+}
+.json-block .num {
+  color: var(--amber);
+}
+
+/* ── Input fields ── */
+.qd-input {
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  color: var(--text-bright);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 0.8125rem;
+  font-family: 'Fira Code', monospace;
+  transition: border-color 0.2s, box-shadow 0.2s;
+  outline: none;
+}
+.qd-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+.qd-input::placeholder {
+  color: var(--text-dim);
+}
+
+.qd-select {
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  color: var(--text-bright);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 0.8125rem;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+.qd-select:focus {
+  border-color: var(--accent);
+}
+
+/* ── Buttons ── */
+.qd-btn {
+  background: var(--accent);
+  color: var(--bg-deep);
+  font-weight: 600;
+  font-size: 0.8125rem;
+  padding: 8px 18px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s;
+  letter-spacing: 0.02em;
+}
+.qd-btn:hover {
+  box-shadow: 0 0 16px var(--accent-glow-strong);
+  transform: translateY(-1px);
+}
+.qd-btn:active {
+  transform: translateY(0);
+}
+
+.qd-btn-ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-body);
+  font-size: 0.8125rem;
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.qd-btn-ghost:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ── Status badges ── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 9999px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.badge-green {
+  background: rgba(34, 197, 94, 0.12);
+  color: #4ade80;
+  border: 1px solid rgba(34, 197, 94, 0.2);
+}
+.badge-yellow {
+  background: rgba(245, 158, 11, 0.12);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.2);
+}
+.badge-red {
+  background: rgba(239, 68, 68, 0.12);
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}
+.badge-blue {
+  background: rgba(56, 189, 248, 0.12);
+  color: #7dd3fc;
+  border: 1px solid rgba(56, 189, 248, 0.2);
+}
+
+/* ── Stat number ── */
+.stat-number {
+  font-family: 'Syne', sans-serif;
+  font-weight: 700;
+  font-size: 1.75rem;
+  color: var(--text-bright);
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+.stat-label {
+  font-size: 0.6875rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 4px;
+}
+
+/* ── Nav ── */
+.qd-nav {
+  background: rgba(8, 12, 20, 0.85);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+/* ── Loading spinner ── */
+@keyframes spin-glow {
+  to { transform: rotate(360deg); }
+}
+.qd-spinner {
+  width: 24px;
+  height: 24px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin-glow 0.8s linear infinite;
+}
+
+/* ── Highlight match ── */
+mark {
+  background: var(--accent-glow-strong);
+  color: var(--accent);
+  padding: 1px 3px;
+  border-radius: 2px;
+}
+
+/* ── HTMX loading indicator ── */
+.htmx-indicator {
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.htmx-request .htmx-indicator {
+  opacity: 1;
+}

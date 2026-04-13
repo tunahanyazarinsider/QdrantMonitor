@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Qdrant Monitor{% endblock %}
+
+{% block content %}
+<!-- ── Summary bar ── -->
+<div class="flex items-center justify-between mb-8">
+  <div>
+    <h1 class="font-display font-bold text-2xl text-white tracking-tight">Collections</h1>
+    <p class="text-sm text-[#4b5f82] mt-1">
+      {% if conn.connected %}
+        {{ collections | length }} collection{{ 's' if collections | length != 1 else '' }}
+        &middot; {{ "{:,}".format(total_points) }} total points
+        &middot; <span class="font-mono text-xs">{{ conn.host }}:{{ conn.port }}</span>
+      {% else %}
+        Not connected to Qdrant
+      {% endif %}
+    </p>
+  </div>
+</div>
+
+{% if not conn.connected %}
+<!-- ── Disconnected state ── -->
+<div class="qd-card p-12 text-center">
+  <div class="mx-auto mb-4 w-12 h-12 rounded-full bg-[rgba(239,68,68,0.1)] flex items-center justify-center">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round">
+      <circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>
+    </svg>
+  </div>
+  <p class="text-[#f87171] font-medium mb-2">Cannot connect to Qdrant</p>
+  <p class="text-sm text-[#4b5f82]">{{ conn.error or 'Check host and port in the top bar' }}</p>
+</div>
+
+{% elif collections | length == 0 %}
+<!-- ── Empty state ── -->
+<div class="qd-card p-12 text-center">
+  <div class="mx-auto mb-4 w-12 h-12 rounded-full bg-[rgba(0,229,160,0.08)] flex items-center justify-center">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#00e5a0" stroke-width="2" stroke-linecap="round">
+      <path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/>
+    </svg>
+  </div>
+  <p class="text-white font-medium mb-2">No collections found</p>
+  <p class="text-sm text-[#4b5f82]">Create a collection in Qdrant to see it here</p>
+</div>
+
+{% else %}
+<!-- ── Collection grid ── -->
+<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
+  {% for col in collections %}
+  <a href="/collection/{{ col.name }}"
+     class="qd-card card-enter p-5 block cursor-pointer"
+     style="animation-delay: {{ loop.index0 * 80 }}ms">
+
+    <!-- Header -->
+    <div class="flex items-start justify-between mb-4">
+      <div class="flex-1 min-w-0">
+        <h2 class="font-display font-bold text-base text-white truncate">{{ col.name }}</h2>
+      </div>
+      {% if col.status == 'green' %}
+      <span class="badge badge-green ml-3">
+        <span class="w-1.5 h-1.5 rounded-full bg-[#4ade80]"></span>Ready
+      </span>
+      {% elif col.status == 'yellow' %}
+      <span class="badge badge-yellow ml-3">
+        <span class="w-1.5 h-1.5 rounded-full bg-[#fbbf24]"></span>Indexing
+      </span>
+      {% else %}
+      <span class="badge badge-red ml-3">
+        <span class="w-1.5 h-1.5 rounded-full bg-[#f87171]"></span>{{ col.status }}
+      </span>
+      {% endif %}
+    </div>
+
+    <!-- Stats -->
+    <div class="grid grid-cols-3 gap-4 mb-4">
+      <div>
+        <div class="stat-number">{{ "{:,}".format(col.points_count) }}</div>
+        <div class="stat-label">Points</div>
+      </div>
+      <div>
+        <div class="stat-number">{{ "{:,}".format(col.indexed_vectors_count) }}</div>
+        <div class="stat-label">Indexed</div>
+      </div>
+      <div>
+        <div class="stat-number {% if col.index_pct == 100 %}text-[#4ade80]{% elif col.index_pct < 50 %}text-[#f87171]{% else %}text-[#fbbf24]{% endif %}">{{ col.index_pct }}%</div>
+        <div class="stat-label">Coverage</div>
+      </div>
+    </div>
+
+    <!-- Vector configs -->
+    <div class="space-y-2 pt-3 border-t border-[#1a2236]">
+      {% for vc in col.vec_configs %}
+      <div class="flex items-center gap-2 text-xs">
+        <span class="font-mono text-[#38bdf8]">{{ vc.name }}</span>
+        <span class="text-[#4b5f82]">&middot;</span>
+        <span class="font-mono text-[#7b8fb5]">{{ vc.size }}d</span>
+        <span class="text-[#4b5f82]">&middot;</span>
+        <span class="text-[#7b8fb5]">{{ vc.distance }}</span>
+      </div>
+      {% endfor %}
+      {% for sc in col.sparse_configs %}
+      <div class="flex items-center gap-2 text-xs">
+        <span class="font-mono text-[#f59e0b]">{{ sc.name }}</span>
+        <span class="text-[#4b5f82]">&middot;</span>
+        <span class="text-[#7b8fb5]">sparse</span>
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- Footer -->
+    <div class="flex items-center justify-between mt-4 pt-3 border-t border-[#1a2236]">
+      <div class="flex items-center gap-1.5 text-xs text-[#4b5f82]">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+        </svg>
+        {{ col.segments_count }} segment{{ 's' if col.segments_count != 1 else '' }}
+      </div>
+      <div class="text-xs text-[#4b5f82]">
+        opt: <span class="font-mono
+          {% if col.optimizer_status == 'ok' %}text-[#4ade80]{% else %}text-[#fbbf24]{% endif %}
+        ">{{ col.optimizer_status }}</span>
+      </div>
+    </div>
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}
