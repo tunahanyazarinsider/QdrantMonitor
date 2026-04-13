@@ -2,6 +2,12 @@
 
 A local dashboard for monitoring and querying Qdrant vector database collections. Built with FastAPI, HTMX, D3.js, and Plotly.
 
+<img width="1452" height="800" alt="Ekran Resmi 2026-04-13 16 05 24" src="https://github.com/user-attachments/assets/280c62fc-1cce-4e48-a487-a318df42a77f" />
+
+<img width="1472" height="774" alt="Ekran Resmi 2026-04-13 16 05 38" src="https://github.com/user-attachments/assets/dcf6bd8a-063f-41dd-b73b-ec0108620f73" />
+
+<img width="1465" height="829" alt="Ekran Resmi 2026-04-13 16 06 08" src="https://github.com/user-attachments/assets/554ad1b5-6bbe-4b67-af71-7506ad135104" />
+
 ## Features
 
 - **Dashboard** — Overview of all collections with point counts, indexing coverage, vector configs, status badges
