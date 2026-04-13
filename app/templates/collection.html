@@ -18,7 +18,7 @@
         {% for vc in collection.vec_configs %}
         <span class="flex items-center gap-1.5">
           <span class="w-1.5 h-1.5 rounded-full bg-[#38bdf8]"></span>
-          <span class="font-mono text-[#38bdf8]">{{ vc.name }}</span>
+          <span class="font-mono text-[#38bdf8]">{{ vc.name or '(default)' }}</span>
           {{ vc.size }}d &middot; {{ vc.distance }}
         </span>
         {% endfor %}
@@ -281,16 +281,21 @@
     <div id="hnsw-graph" class="qd-card relative" style="height: 560px; overflow: hidden;"></div>
   </div>
 
+  <!-- Shared datalist for vector name suggestions -->
+  <datalist id="vector-names">
+    {% for vc in collection.vec_configs %}
+    <option value="{{ vc.name }}">{{ vc.name or '(default)' }} ({{ vc.size }}d)</option>
+    {% endfor %}
+  </datalist>
+
   <!-- ── PCA panel ── -->
   <div id="viz-pca-panel" class="hidden">
     <div class="flex flex-wrap items-end gap-3 mb-4">
       <div>
-        <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Vector</label>
-        <select id="viz-vector" class="qd-select text-xs py-1.5">
-          {% for vc in collection.vec_configs %}
-          <option value="{{ vc.name }}">{{ vc.name }} ({{ vc.size }}d)</option>
-          {% endfor %}
-        </select>
+        <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Vector name</label>
+        <input id="viz-vector" list="vector-names"
+               value="{{ collection.vec_configs[0].name if collection.vec_configs else '' }}"
+               class="qd-input text-xs py-1.5 w-40" placeholder="empty = default">
       </div>
       <div>
         <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Sample</label>

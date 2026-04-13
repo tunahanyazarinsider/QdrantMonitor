@@ -92,7 +92,7 @@ def _vec_configs(info) -> list[dict]:
     elif vectors is not None:
         configs.append(
             {
-                "name": "(default)",
+                "name": "",
                 "size": vectors.size,
                 "distance": (
                     vectors.distance.value
@@ -441,7 +441,7 @@ def _pca_2d(vectors: np.ndarray) -> np.ndarray:
 @app.get("/api/{name}/vectors-2d")
 def vectors_2d(
     name: str,
-    vector_name: str = Query("dense"),
+    vector_name: str = Query(""),
     sample: int = Query(300, ge=50, le=2000),
     color_field: str = Query(""),
 ):
@@ -457,7 +457,7 @@ def vectors_2d(
                 limit=min(100, sample - len(all_points)),
                 offset=next_off,
                 with_payload=True,
-                with_vectors=[vector_name],
+                with_vectors=True if vector_name == "" else [vector_name],
             )
             if not batch:
                 break

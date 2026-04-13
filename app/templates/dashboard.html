@@ -90,7 +90,7 @@
     <div class="space-y-2 pt-3 border-t border-[#1a2236]">
       {% for vc in col.vec_configs %}
       <div class="flex items-center gap-2 text-xs">
-        <span class="font-mono text-[#38bdf8]">{{ vc.name }}</span>
+        <span class="font-mono text-[#38bdf8]">{{ vc.name or '(default)' }}</span>
         <span class="text-[#4b5f82]">&middot;</span>
         <span class="font-mono text-[#7b8fb5]">{{ vc.size }}d</span>
         <span class="text-[#4b5f82]">&middot;</span>
