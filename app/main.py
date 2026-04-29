@@ -678,9 +678,8 @@ def knn_graph(
 
         need_payload = bool(color_field or group_field)
         payload_spec: list[str] | bool = [f for f in [color_field, group_field] if f] or False
-        with_vecs: bool | list[str] = True if vec_name is None else [vec_name]
 
-        # Scroll with vectors
+        # Scroll with ALL vectors — auto-detect which named vector actually has data
         sampled = []
         next_off = None
         while len(sampled) < sample:
@@ -689,7 +688,7 @@ def knn_graph(
                 limit=min(100, sample - len(sampled)),
                 offset=next_off,
                 with_payload=payload_spec if need_payload else False,
-                with_vectors=with_vecs,
+                with_vectors=True,
             )
             if not batch:
                 break
@@ -697,15 +696,42 @@ def knn_graph(
             if next_off is None:
                 break
 
-        # Extract valid vectors
+        # Extract valid dense vectors, auto-detecting which named vector has data.
+        # Collections can have defined-but-unpopulated named vectors; we pick the first
+        # that actually returns list data, preferring the config-selected vec_name.
         valid_pts, valid_vecs = [], []
+        detected_vec_name: str | None = None
         for p in sampled:
             v = p.vector
+            chosen = None
             if isinstance(v, dict):
-                v = v.get(vec_name) if vec_name else next(iter(v.values()), None)
-            if v is not None:
+                # Try config-selected name first, then any dense (list) vector
+                candidates = ([vec_name] if vec_name and vec_name in v else []) + [
+                    vn for vn in v if vn != vec_name
+                ]
+                for cname in candidates:
+                    val = v[cname]
+                    if isinstance(val, list) and len(val) > 0:
+                        chosen = val
+                        if detected_vec_name is None:
+                            detected_vec_name = cname
+                            # Update distance_str for the actually-used vector
+                            if isinstance(vecs_cfg, dict) and cname in vecs_cfg:
+                                _vc2 = vecs_cfg[cname]
+                                distance_str = (
+                                    _vc2.distance.value
+                                    if hasattr(_vc2.distance, "value")
+                                    else str(_vc2.distance)
+                                )
+                        break
+            elif isinstance(v, list) and len(v) > 0:
+                chosen = v
+            if chosen is not None:
                 valid_pts.append(p)
-                valid_vecs.append(v)
+                valid_vecs.append(chosen)
+
+        if detected_vec_name:
+            vec_name = detected_vec_name
 
         if len(valid_pts) < 2:
             return JSONResponse({"error": "Not enough points with vectors"}, status_code=400)
