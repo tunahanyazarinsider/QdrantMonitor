@@ -721,13 +721,24 @@ def knn_graph(
             # disconnected sub-HNSWs. We discover groups first via a quick probe.
             from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-            probe, _ = conn.client.scroll(
-                collection_name=name,
-                limit=300,
-                with_payload=[group_field],
-                with_vectors=False,
-            )
-            group_vals = list({_payload_val(p.payload, group_field) for p in probe})
+            # Scroll up to min(1000, actual_points) to discover all unique group values
+            probe_limit = min(1000, actual_points)
+            probe_pts: list = []
+            probe_off = None
+            while len(probe_pts) < probe_limit:
+                b, probe_off = conn.client.scroll(
+                    collection_name=name,
+                    limit=min(100, probe_limit - len(probe_pts)),
+                    offset=probe_off,
+                    with_payload=[group_field],
+                    with_vectors=False,
+                )
+                if not b:
+                    break
+                probe_pts.extend(b)
+                if probe_off is None:
+                    break
+            group_vals = list({_payload_val(p.payload, group_field) for p in probe_pts})
             group_vals = [v for v in group_vals if v and v != "(no value)"][:30]
 
             per_group = max(sample // max(len(group_vals), 1), effective_m * 2 + 2)
