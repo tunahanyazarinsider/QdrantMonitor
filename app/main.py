@@ -626,7 +626,7 @@ def _payload_val(payload: dict | None, field: str) -> str:
 @app.get("/api/{name}/knn-graph")
 def knn_graph(
     name: str,
-    sample: int = Query(80, ge=20, le=200),
+    sample: int = Query(80, ge=20, le=500),
     color_field: str = Query(""),
     refresh: bool = Query(False),
 ):
@@ -642,15 +642,25 @@ def knn_graph(
         info = conn.client.get_collection(name)
         actual_points = info.points_count or 0
         hnsw = info.config.hnsw_config
-        m = (hnsw.m if hnsw else 16) or 16
+        m_raw = hnsw.m if hnsw else 16
         ef_construct = getattr(hnsw, "ef_construct", 100) if hnsw else 100
         payload_m = getattr(hnsw, "payload_m", 0) or 0
+        # m=0 means no global HNSW index; fall back to payload_m or 16
+        effective_m = m_raw if m_raw > 0 else (payload_m if payload_m > 0 else 16)
 
-        # Distance metric + first vector name
+        # Distance metric + first DENSE vector name (skip sparse)
         vecs_cfg = info.config.params.vectors
         if isinstance(vecs_cfg, dict):
-            vec_name = next(iter(vecs_cfg))
-            vc = vecs_cfg[vec_name]
+            vec_name = None
+            vc = None
+            for vn, vcfg in vecs_cfg.items():
+                if hasattr(vcfg, "size") and vcfg.size:
+                    vec_name = vn
+                    vc = vcfg
+                    break
+            if vec_name is None:
+                vec_name = next(iter(vecs_cfg))
+                vc = vecs_cfg[vec_name]
         else:
             vec_name = None
             vc = vecs_cfg
@@ -704,7 +714,7 @@ def knn_graph(
         ids = [str(p.id) for p in valid_pts]
         dist_matrix = _compute_dist_matrix(mat, distance_str)
 
-        if payload_m > 0 and group_field:
+        if (m_raw == 0 and payload_m > 0) or (payload_m > 0 and group_field):
             # Separate HNSW per payload group, use payload_m as M
             groups: dict[str, list[int]] = {}
             for i, p in enumerate(valid_pts):
@@ -732,7 +742,7 @@ def knn_graph(
             nodes, links = all_nodes, all_links
             payload_m_mode = True
         else:
-            nodes, links = _build_hnsw(ids, dist_matrix, m)
+            nodes, links = _build_hnsw(ids, dist_matrix, effective_m)
             for nd in nodes:
                 i = ids.index(nd["id"])
                 nd["group"] = _payload_val(valid_pts[i].payload, group_field)
@@ -743,7 +753,7 @@ def knn_graph(
 
         result = {
             "config": {
-                "m": m,
+                "m": effective_m,
                 "ef_construct": ef_construct,
                 "payload_m": payload_m,
                 "distance": distance_str,
