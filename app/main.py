@@ -740,40 +740,17 @@ def knn_graph(
         ids = [str(p.id) for p in valid_pts]
         dist_matrix = _compute_dist_matrix(mat, distance_str)
 
-        if (m_raw == 0 and payload_m > 0) or (payload_m > 0 and group_field):
-            # Separate HNSW per payload group, use payload_m as M
-            groups: dict[str, list[int]] = {}
-            for i, p in enumerate(valid_pts):
-                gv = _payload_val(p.payload, group_field)
-                groups.setdefault(gv, []).append(i)
-
-            all_nodes: list[dict] = []
-            all_links: list[dict] = []
-            for gv, g_idxs in groups.items():
-                g_ids = [ids[i] for i in g_idxs]
-                if len(g_idxs) < 2:
-                    all_nodes.append({
-                        "id": g_ids[0], "layer": 0, "is_entry": False,
-                        "group": gv,
-                        "color_value": _payload_val(valid_pts[g_idxs[0]].payload, color_field),
-                    })
-                    continue
-                g_dist = dist_matrix[np.ix_(g_idxs, g_idxs)]
-                g_nodes, g_links = _build_hnsw(g_ids, g_dist, payload_m)
-                for nd in g_nodes:
-                    nd["group"] = gv
-                    nd["color_value"] = _payload_val(valid_pts[ids.index(nd["id"])].payload, color_field)
-                all_nodes.extend(g_nodes)
-                all_links.extend(g_links)
-            nodes, links = all_nodes, all_links
-            payload_m_mode = True
-        else:
-            nodes, links = _build_hnsw(ids, dist_matrix, effective_m)
-            for nd in nodes:
-                i = ids.index(nd["id"])
-                nd["group"] = _payload_val(valid_pts[i].payload, group_field)
-                nd["color_value"] = _payload_val(valid_pts[i].payload, color_field)
-            payload_m_mode = False
+        # Always build one HNSW for all sampled nodes.
+        # Splitting by group_field creates tiny sub-graphs when payload fields are
+        # high-cardinality, leaving most nodes at layer=0 with 0 edges.
+        # payload_m_mode only controls the D3 horizontal band layout.
+        id_to_idx = {sid: i for i, sid in enumerate(ids)}
+        nodes, links = _build_hnsw(ids, dist_matrix, effective_m)
+        for nd in nodes:
+            i = id_to_idx[nd["id"]]
+            nd["group"] = _payload_val(valid_pts[i].payload, group_field)
+            nd["color_value"] = _payload_val(valid_pts[i].payload, color_field)
+        payload_m_mode = bool(payload_m > 0 and group_field)
 
         max_layer = max((nd["layer"] for nd in nodes), default=0)
 
