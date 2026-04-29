@@ -297,6 +297,8 @@
           <option value="200">200</option>
           <option value="300">300</option>
           <option value="500">500</option>
+          <option value="1000">1000</option>
+          <option value="2000">2000</option>
         </select>
       </div>
       <div>
@@ -314,6 +316,7 @@
     </div>
 
     <div id="hnsw-config" class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4"></div>
+    <div id="hnsw-layer-toggles" class="flex flex-wrap items-center gap-3 mb-3"></div>
     <div id="hnsw-legend" class="flex flex-wrap gap-3 mb-4"></div>
 
     <p class="text-[0.6875rem] text-[#4b5f82] mb-3">
@@ -321,6 +324,10 @@
       Node size = layer. Entry point highlighted. Results cached — use ↺ Refresh to rebuild.
     </p>
     <div id="hnsw-graph" class="qd-card relative" style="height: 560px; overflow: hidden;"></div>
+    <div id="hnsw-similar-panel" class="hidden mt-3 p-3 qd-card">
+      <p id="hnsw-similar-label" class="text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-2">Click a node to find similar points</p>
+      <div id="hnsw-similar-results"></div>
+    </div>
   </div>
 
   <!-- Shared datalist for vector name suggestions -->
@@ -422,17 +429,55 @@ const PALETTE = [
   '#818cf8', '#34d399', '#fb7185', '#60a5fa', '#c084fc'
 ];
 
+// HNSW graph state
+let _hnswSim = null;
+let _hnswNodeSel = null;
+let _hnswLinkSel = null;
+let _hnswL0Collapsed = false;
+let _hnswLayerVisible = {};
+let _hnswData = null;
+const _hnswLayerColors = ['#1e3a5f', '#2563eb', '#38bdf8', '#00e5a0', '#f59e0b'];
+
+window._hnswToggleLayer = function(layer, visible) {
+  _hnswLayerVisible[layer] = visible;
+  if (!_hnswNodeSel || !_hnswLinkSel) return;
+  _hnswNodeSel.attr('display', d => _hnswLayerVisible[d.layer] === false ? 'none' : null);
+  _hnswLinkSel.attr('display', d => {
+    const sl = typeof d.source === 'object' ? d.source.layer : 0;
+    const tl = typeof d.target === 'object' ? d.target.layer : 0;
+    return (_hnswLayerVisible[sl] === false || _hnswLayerVisible[tl] === false || _hnswLayerVisible[d.layer] === false) ? 'none' : null;
+  });
+};
+
+window._hnswCollapseL0 = function(collapse) {
+  _hnswL0Collapsed = collapse;
+  if (!_hnswNodeSel) return;
+  _hnswNodeSel
+    .attr('r', d => d.layer === 0 ? (collapse ? 2 : 3) : 3 + d.layer * 2.5)
+    .attr('fill-opacity', d => d.layer === 0 ? (collapse ? 0.2 : 0.6) : 0.65 + d.layer * 0.1);
+  _hnswLinkSel.attr('stroke-opacity', d => {
+    const sl = typeof d.source === 'object' ? d.source.layer : 0;
+    const tl = typeof d.target === 'object' ? d.target.layer : 0;
+    if (collapse && sl === 0 && tl === 0) return 0.03;
+    return 0.12 + d.layer * 0.18;
+  });
+};
+
 async function generateHnsw(forceRefresh = false) {
   const sample = document.getElementById('hnsw-max-nodes').value;
   const colorField = document.getElementById('knn-color').value;
   const btn = document.getElementById('hnsw-btn');
   const spinner = document.getElementById('hnsw-spinner');
-  btn.disabled = true; btn.textContent = 'Loading\u2026'; spinner.classList.remove('hidden');
+  btn.disabled = true; btn.textContent = 'Loading…'; spinner.classList.remove('hidden');
 
   try {
     const url = `/api/{{ collection.name }}/knn-graph?sample=${sample}&color_field=${encodeURIComponent(colorField)}&refresh=${forceRefresh}`;
     const resp = await fetch(url);
     const data = await resp.json();
+    _hnswData = data;
+    _hnswL0Collapsed = false;
+    _hnswLayerVisible = {};
+
     if (data.error) {
       document.getElementById('hnsw-graph').innerHTML =
         `<p class="p-8 text-center text-[#f87171] text-sm">${data.error}</p>`;
@@ -446,7 +491,7 @@ async function generateHnsw(forceRefresh = false) {
         <div class="stat-label">M (from config)</div>
       </div>
       <div class="qd-card p-3 text-center">
-        <div class="stat-number text-base">${cfg.payload_m || '\u2014'}</div>
+        <div class="stat-number text-base">${cfg.payload_m || '—'}</div>
         <div class="stat-label">payload_m</div>
       </div>
       <div class="qd-card p-3 text-center">
@@ -467,7 +512,24 @@ async function generateHnsw(forceRefresh = false) {
       </div>
     `;
 
-    // Color: by color_value if set, else by layer
+    const maxLayer = cfg.max_layer || 0;
+
+    // B: Layer toggle checkboxes + C: Collapse L0 checkbox
+    const togglesEl = document.getElementById('hnsw-layer-toggles');
+    let togglesHTML = '<span class="text-[0.6875rem] text-[#4b5f82] mr-1">Layers:</span>';
+    for (let l = 0; l <= maxLayer; l++) {
+      togglesHTML += `<label class="flex items-center gap-1 text-xs cursor-pointer">
+        <input type="checkbox" checked onchange="window._hnswToggleLayer(${l}, this.checked)" class="accent-[#00e5a0]">
+        <span style="color:${_hnswLayerColors[Math.min(l, _hnswLayerColors.length-1)]}">L${l}${l === maxLayer && maxLayer > 0 ? '★' : ''}</span>
+      </label>`;
+    }
+    togglesHTML += `<label class="flex items-center gap-1 text-xs cursor-pointer ml-3 border-l border-[#1e293b] pl-3">
+      <input type="checkbox" onchange="window._hnswCollapseL0(this.checked)" class="accent-[#f59e0b]">
+      <span class="text-[#7b8fb5]">Collapse L0</span>
+    </label>`;
+    togglesEl.innerHTML = togglesHTML;
+
+    // Color setup
     const useColorField = data.color_field && data.nodes.some(n => n.color_value && n.color_value !== '(no value)');
     const uniqueVals = useColorField
       ? [...new Set(data.nodes.map(n => n.color_value).filter(v => v))]
@@ -475,14 +537,11 @@ async function generateHnsw(forceRefresh = false) {
     const colorValMap = {};
     uniqueVals.forEach((v, i) => { colorValMap[v] = PALETTE[i % PALETTE.length]; });
 
-    const maxLayer = cfg.max_layer || 0;
-    const layerColors = ['#1e3a5f', '#2563eb', '#38bdf8', '#00e5a0', '#f59e0b'];
     const nodeColor = (n) => {
       if (useColorField && n.color_value) return colorValMap[n.color_value] || '#94a8c8';
-      return layerColors[Math.min(n.layer, layerColors.length - 1)];
+      return _hnswLayerColors[Math.min(n.layer, _hnswLayerColors.length - 1)];
     };
 
-    // Legend: color_value legend or layer legend
     if (useColorField) {
       document.getElementById('hnsw-legend').innerHTML = uniqueVals.slice(0, 14).map((v, i) =>
         `<span class="flex items-center gap-1.5 text-xs">
@@ -491,7 +550,7 @@ async function generateHnsw(forceRefresh = false) {
         </span>`
       ).join('');
     } else {
-      document.getElementById('hnsw-legend').innerHTML = layerColors.slice(0, maxLayer + 1).map((c, i) =>
+      document.getElementById('hnsw-legend').innerHTML = _hnswLayerColors.slice(0, maxLayer + 1).map((c, i) =>
         `<span class="flex items-center gap-1.5 text-xs">
           <span class="w-2.5 h-2.5 rounded-full" style="background:${c}"></span>
           <span class="text-[#7b8fb5]">Layer ${i}${i === maxLayer && maxLayer > 0 ? ' (entry zone)' : ''}</span>
@@ -507,91 +566,81 @@ async function generateHnsw(forceRefresh = false) {
     const width = container.clientWidth;
     const height = container.clientHeight;
 
-    const svg = d3.select(container).append('svg')
-      .attr('width', width).attr('height', height)
-      .style('background', '#0a0e17');
-    const g = svg.append('g');
-    svg.call(d3.zoom().scaleExtent([0.15, 8]).on('zoom', (e) => g.attr('transform', e.transform)));
-
-    const nodes = data.nodes.map(n => ({ ...n }));
-    const links = data.links
-      .map(l => ({ source: idToIdx[l.source], target: idToIdx[l.target], layer: l.layer, score: l.score }))
-      .filter(l => l.source !== undefined && l.target !== undefined);
-
-    // Layer Y positions: higher layer = higher on screen (inverted: layer 0 at bottom)
     const layerPad = 60;
     const layerY = (layer) => {
       if (maxLayer === 0) return height / 2;
       return height - layerPad - (layer / maxLayer) * (height - layerPad * 2);
     };
 
-    // payload_m mode: horizontal group bands
+    const svg = d3.select(container).append('svg')
+      .attr('width', width).attr('height', height)
+      .style('background', '#0a0e17');
+
+    // Layer band lines + labels (outside g so they don't zoom)
+    for (let l = 0; l <= maxLayer; l++) {
+      svg.append('line')
+        .attr('x1', 32).attr('y1', layerY(l))
+        .attr('x2', width).attr('y2', layerY(l))
+        .attr('stroke', _hnswLayerColors[Math.min(l, _hnswLayerColors.length - 1)])
+        .attr('stroke-opacity', 0.06).attr('stroke-width', 1).attr('stroke-dasharray', '4 4');
+      svg.append('text')
+        .attr('x', 4).attr('y', layerY(l))
+        .attr('fill', _hnswLayerColors[Math.min(l, _hnswLayerColors.length - 1)])
+        .attr('font-size', '10px').attr('font-family', 'Fira Code, monospace')
+        .attr('dominant-baseline', 'middle')
+        .text(`L${l}${l === maxLayer && maxLayer > 0 ? '★' : ''}`);
+    }
+
+    const g = svg.append('g');
+    svg.call(d3.zoom().scaleExtent([0.1, 12]).on('zoom', (e) => g.attr('transform', e.transform)));
+
+    const nodes = data.nodes.map(n => ({ ...n }));
+    const links = data.links
+      .map(l => ({ source: idToIdx[l.source], target: idToIdx[l.target], layer: l.layer, score: l.score }))
+      .filter(l => l.source !== undefined && l.target !== undefined);
+
+    // payload_m group bands
     const groups = data.payload_m_mode ? [...new Set(data.nodes.map(n => n.group))] : [];
     const groupX = {};
     if (data.payload_m_mode && groups.length > 0) {
       const bandW = width / groups.length;
       groups.forEach((gr, i) => { groupX[gr] = bandW * i + bandW / 2; });
-    }
-
-    const sim = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink(links).distance(d => 20 + (1 - Math.max(d.score || 0, 0)) * 30).strength(0.4))
-      .force('charge', d3.forceManyBody().strength(-40))
-      .force('collision', d3.forceCollide().radius(d => 4 + d.layer * 2.5))
-      // Strong Y pull toward layer band
-      .force('ly', d3.forceY(d => layerY(d.layer)).strength(0.8))
-      // Horizontal: group band (payload_m) or center
-      .force('lx', d3.forceX(d =>
-        data.payload_m_mode ? (groupX[d.group] ?? width / 2) : width / 2
-      ).strength(data.payload_m_mode ? 0.3 : 0.05));
-
-    // Draw layer band labels on SVG (not in g so they don't zoom)
-    for (let l = 0; l <= maxLayer; l++) {
-      svg.append('text')
-        .attr('x', 8).attr('y', layerY(l))
-        .attr('fill', layerColors[Math.min(l, layerColors.length - 1)])
-        .attr('font-size', '10px').attr('font-family', 'Fira Code, monospace')
-        .attr('dominant-baseline', 'middle')
-        .text(`L${l}${l === maxLayer ? ' ★' : ''}`);
-
-      svg.append('line')
-        .attr('x1', 28).attr('y1', layerY(l))
-        .attr('x2', width).attr('y2', layerY(l))
-        .attr('stroke', layerColors[Math.min(l, layerColors.length - 1)])
-        .attr('stroke-opacity', 0.06)
-        .attr('stroke-width', 1)
-        .attr('stroke-dasharray', '4 4');
-    }
-
-    // Group band labels for payload_m
-    if (data.payload_m_mode) {
       groups.forEach((gr, i) => {
-        const bandW = width / groups.length;
         svg.append('text')
-          .attr('x', bandW * i + bandW / 2).attr('y', 14)
-          .attr('text-anchor', 'middle')
-          .attr('fill', '#4b5f82').attr('font-size', '9px')
-          .attr('font-family', 'DM Sans, sans-serif')
+          .attr('x', (width / groups.length) * i + (width / groups.length) / 2).attr('y', 14)
+          .attr('text-anchor', 'middle').attr('fill', '#4b5f82')
+          .attr('font-size', '9px').attr('font-family', 'DM Sans, sans-serif')
           .text(gr.length > 18 ? gr.slice(0, 16) + '…' : gr);
       });
     }
 
-    // Link: opacity/width by layer
-    const link = g.append('g').selectAll('line').data(links).join('line')
-      .attr('stroke', d => layerColors[Math.min(d.layer, layerColors.length - 1)])
+    if (_hnswSim) _hnswSim.stop();
+    _hnswSim = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(links).distance(d => 18 + (1 - Math.max(d.score || 0, 0)) * 28).strength(0.4))
+      .force('charge', d3.forceManyBody().strength(-35))
+      .force('collision', d3.forceCollide().radius(d => d.layer === 0 ? 4 : 4 + d.layer * 2.5))
+      .force('ly', d3.forceY(d => layerY(d.layer)).strength(0.85))
+      // A: Pyramid X — higher layers pulled harder toward center
+      .force('lx', d3.forceX(d =>
+        data.payload_m_mode ? (groupX[d.group] ?? width / 2) : width / 2
+      ).strength(d => data.payload_m_mode ? 0.3 : 0.08 + d.layer * 0.09));
+
+    _hnswLinkSel = g.append('g').selectAll('line').data(links).join('line')
+      .attr('stroke', d => _hnswLayerColors[Math.min(d.layer, _hnswLayerColors.length - 1)])
       .attr('stroke-opacity', d => 0.12 + d.layer * 0.18)
       .attr('stroke-width', d => 0.4 + d.layer * 0.6);
 
-    // Node: size by layer, entry = white ring
-    const node = g.append('g').selectAll('circle').data(nodes).join('circle')
-      .attr('r', d => 3 + d.layer * 2.5)
+    _hnswNodeSel = g.append('g').selectAll('circle').data(nodes).join('circle')
+      .attr('r', d => d.layer === 0 ? 3 : 3 + d.layer * 2.5)
       .attr('fill', d => nodeColor(d))
-      .attr('fill-opacity', d => 0.65 + d.layer * 0.1)
+      .attr('fill-opacity', d => d.layer === 0 ? 0.6 : 0.65 + d.layer * 0.1)
       .attr('stroke', d => d.is_entry ? '#fff' : 'none')
       .attr('stroke-width', d => d.is_entry ? 2.5 : 0)
+      .style('cursor', 'pointer')
       .call(d3.drag()
-        .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+        .on('start', (e, d) => { if (!e.active) _hnswSim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
         .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
-        .on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
+        .on('end', (e, d) => { if (!e.active) _hnswSim.alphaTarget(0); d.fx = null; d.fy = null; })
       );
 
     const tooltip = d3.select(container).append('div')
@@ -601,18 +650,34 @@ async function generateHnsw(forceRefresh = false) {
       .style('font-size', '11px').style('font-family', 'Fira Code, monospace')
       .style('color', '#d0dce8').style('opacity', 0).style('z-index', 10);
 
-    node.on('mouseover', (e, d) => {
-      tooltip.style('opacity', 1).html(
-        `ID: <span style="color:#00e5a0">${d.id}</span><br>Layer: ${d.layer}${d.is_entry ? ' \u2605 entry' : ''}` +
-        (d.group ? `<br>group: ${d.group}` : '') +
-        (d.color_value ? `<br>${data.color_field}: ${d.color_value}` : '')
-      ).style('left', (e.offsetX + 12) + 'px').style('top', (e.offsetY - 10) + 'px');
-    }).on('mouseout', () => tooltip.style('opacity', 0));
+    _hnswNodeSel
+      .on('mouseover', (e, d) => {
+        tooltip.style('opacity', 1).html(
+          `ID: <span style="color:#00e5a0">${d.id}</span><br>Layer: ${d.layer}${d.is_entry ? ' ★ entry' : ''}` +
+          (d.group ? `<br>group: ${d.group}` : '') +
+          (d.color_value ? `<br>${data.color_field}: ${d.color_value}` : '') +
+          `<br><span style="color:#4b5f82;font-size:9px">click to find similar</span>`
+        ).style('left', (e.offsetX + 12) + 'px').style('top', (e.offsetY - 10) + 'px');
+      })
+      .on('mouseout', () => tooltip.style('opacity', 0))
+      // D: Node click → similar panel
+      .on('click', (e, d) => {
+        e.stopPropagation();
+        const panel = document.getElementById('hnsw-similar-panel');
+        const label = document.getElementById('hnsw-similar-label');
+        panel.classList.remove('hidden');
+        label.textContent = `Similar to ${d.id} (L${d.layer}) — loading…`;
+        htmx.ajax('GET',
+          `/api/{{ collection.name }}/search-similar?point_id=${encodeURIComponent(d.id)}&limit=10`,
+          { target: '#hnsw-similar-results', swap: 'innerHTML' }
+        ).then(() => { label.textContent = `Similar to ${d.id} (L${d.layer})`; });
+      });
 
-    sim.on('tick', () => {
-      link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
-          .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
-      node.attr('cx', d => d.x).attr('cy', d => d.y);
+    _hnswSim.on('tick', () => {
+      _hnswLinkSel
+        .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+      _hnswNodeSel.attr('cx', d => d.x).attr('cy', d => d.y);
     });
 
   } catch (err) {
@@ -622,6 +687,7 @@ async function generateHnsw(forceRefresh = false) {
     btn.disabled = false; btn.textContent = 'Generate'; spinner.classList.add('hidden');
   }
 }
+
 
 let currentVizData = null;
 

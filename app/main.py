@@ -626,7 +626,7 @@ def _payload_val(payload: dict | None, field: str) -> str:
 @app.get("/api/{name}/knn-graph")
 def knn_graph(
     name: str,
-    sample: int = Query(80, ge=20, le=500),
+    sample: int = Query(80, ge=20, le=2000),
     color_field: str = Query(""),
     refresh: bool = Query(False),
 ):
