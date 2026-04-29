@@ -431,6 +431,53 @@ async def search_by_text(
     })
 
 
+@app.get("/api/{name}/search-similar", response_class=HTMLResponse)
+async def search_similar(
+    request: Request,
+    name: str,
+    point_id: str = Query(""),
+    limit: int = Query(10, ge=1, le=50),
+    vector_name: str = Query(""),
+):
+    if not conn.connected or not point_id.strip():
+        return _render(request, "partials/search_similar_result.html", {
+            "results": [],
+            "error": "Not connected" if not conn.connected else "",
+            "query_id": point_id,
+        })
+    parsed = _parse_id(point_id.strip())
+    try:
+        results = conn.client.query_points(
+            collection_name=name,
+            query=parsed,
+            using=vector_name if vector_name else None,
+            limit=limit,
+            with_payload=True,
+        )
+        rows = [
+            {
+                "id": pt.id,
+                "score": round(pt.score, 6),
+                "payload": pt.payload or {},
+                "payload_json": json.dumps(
+                    pt.payload, ensure_ascii=False, indent=2, default=str
+                ),
+            }
+            for pt in results.points
+        ]
+        return _render(request, "partials/search_similar_result.html", {
+            "results": rows,
+            "error": "",
+            "query_id": point_id,
+        })
+    except Exception as exc:
+        return _render(request, "partials/search_similar_result.html", {
+            "results": [],
+            "error": str(exc),
+            "query_id": point_id,
+        })
+
+
 def _pca_2d(vectors: np.ndarray) -> np.ndarray:
     """Reduce to 2D via PCA (numpy SVD, no sklearn needed)."""
     centered = vectors - vectors.mean(axis=0)
@@ -509,6 +556,90 @@ def vectors_2d(
             "labels": labels,
             "categories": categories,
             "count": len(ids),
+        })
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/{name}/knn-graph")
+def knn_graph(
+    name: str,
+    sample: int = Query(80, ge=20, le=200),
+    m: int = Query(8, ge=2, le=32),
+    color_field: str = Query(""),
+):
+    """Build a real KNN graph by querying Qdrant's index for each sampled node."""
+    if not conn.connected:
+        return JSONResponse({"error": "Not connected"}, status_code=400)
+
+    try:
+        info = conn.client.get_collection(name)
+        actual_points = info.points_count or 0
+
+        sampled = []
+        next_off = None
+        while len(sampled) < sample:
+            batch, next_off = conn.client.scroll(
+                collection_name=name,
+                limit=min(100, sample - len(sampled)),
+                offset=next_off,
+                with_payload=True if color_field else False,
+                with_vectors=False,
+            )
+            if not batch:
+                break
+            sampled.extend(batch)
+            if next_off is None:
+                break
+
+        if len(sampled) < 2:
+            return JSONResponse({"error": "Not enough points"}, status_code=400)
+
+        sampled_id_set = set(str(p.id) for p in sampled)
+
+        color_map: dict[str, str] = {}
+        if color_field:
+            for p in sampled:
+                val = (p.payload or {}).get(color_field)
+                if isinstance(val, list):
+                    val = val[0] if val else None
+                color_map[str(p.id)] = str(val) if val is not None else "(no value)"
+
+        nodes = [{"id": str(p.id), "color_value": color_map.get(str(p.id), "")} for p in sampled]
+        links = []
+        seen_edges: set[tuple] = set()
+
+        for pt in sampled:
+            try:
+                results = conn.client.query_points(
+                    collection_name=name,
+                    query=pt.id,
+                    limit=m + 1,
+                    with_payload=False,
+                )
+                for r in results.points:
+                    if str(r.id) == str(pt.id):
+                        continue
+                    if str(r.id) not in sampled_id_set:
+                        continue
+                    src, tgt = str(pt.id), str(r.id)
+                    edge = (min(src, tgt), max(src, tgt))
+                    if edge not in seen_edges:
+                        seen_edges.add(edge)
+                        links.append({"source": src, "target": tgt, "score": round(r.score, 4)})
+            except Exception:
+                continue
+
+        return JSONResponse({
+            "config": {
+                "sample": len(sampled),
+                "m": m,
+                "actual_points": actual_points,
+                "edges": len(links),
+            },
+            "color_field": color_field,
+            "nodes": nodes,
+            "links": links,
         })
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
@@ -647,7 +778,15 @@ def hnsw_graph(
 
 # ── Entry point ──────────────────────────────────────────────────────
 def run():
+    import sys
+
     import uvicorn
+
+    # Ensure the project root is on sys.path so uvicorn's reloader can
+    # import "app.main" when spawning a subprocess.
+    project_root = str(Path(__file__).resolve().parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
 
     uvicorn.run("app.main:app", host="0.0.0.0", port=11000, reload=True)
 

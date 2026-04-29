@@ -1,0 +1,34 @@
+{% if error %}
+<p class="text-[#f87171] text-sm p-2">{{ error }}</p>
+{% elif not results %}
+<p class="text-[#4b5f82] text-sm p-2">No results for ID <span class="font-mono">{{ query_id }}</span>.</p>
+{% else %}
+<p class="text-[0.6875rem] text-[#4b5f82] mb-3">
+  {{ results|length }} most similar to <span class="font-mono text-[#00e5a0]">{{ query_id }}</span>
+</p>
+<div class="overflow-x-auto">
+  <table class="qd-table w-full text-xs">
+    <thead>
+      <tr>
+        <th class="text-left px-3 py-2">ID</th>
+        <th class="text-left px-3 py-2">Score</th>
+        <th class="text-left px-3 py-2">Payload</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in results %}
+      <tr class="border-t border-[#1a2236]">
+        <td class="px-3 py-2 font-mono text-[#38bdf8]">{{ r.id }}</td>
+        <td class="px-3 py-2 font-mono text-[#00e5a0]">{{ r.score }}</td>
+        <td class="px-3 py-2">
+          <button onclick="this.nextElementSibling.classList.toggle('hidden'); this.textContent = this.textContent === '+' ? '−' : '+'"
+                  class="text-[#4b5f82] hover:text-[#00e5a0] mr-2 font-mono">+</button>
+          <span class="text-[#7b8fb5]">{{ r.payload | trunc }}</span>
+          <pre class="hidden mt-1 text-[0.625rem] text-[#94a8c8] bg-[#0a0e17] rounded p-2 overflow-x-auto">{{ r.payload_json }}</pre>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
