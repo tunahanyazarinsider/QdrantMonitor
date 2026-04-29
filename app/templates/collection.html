@@ -516,37 +516,76 @@ async function generateHnsw(forceRefresh = false) {
       .map(l => ({ source: idToIdx[l.source], target: idToIdx[l.target], layer: l.layer, score: l.score }))
       .filter(l => l.source !== undefined && l.target !== undefined);
 
-    // Group separation for payload_m mode
-    const sim = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink(links).distance(d => 15 + (1 - Math.max(d.score || 0, 0)) * 30).strength(0.6))
-      .force('charge', d3.forceManyBody().strength(-30))
-      .force('center', d3.forceCenter(width / 2, height / 2))
-      .force('collision', d3.forceCollide().radius(d => 3 + d.layer * 2));
+    // Layer Y positions: higher layer = higher on screen (inverted: layer 0 at bottom)
+    const layerPad = 60;
+    const layerY = (layer) => {
+      if (maxLayer === 0) return height / 2;
+      return height - layerPad - (layer / maxLayer) * (height - layerPad * 2);
+    };
 
-    if (data.payload_m_mode) {
-      const groups = [...new Set(data.nodes.map(n => n.group))];
-      const gCenters = {};
-      groups.forEach((g, i) => {
-        const a = (2 * Math.PI * i) / groups.length;
-        gCenters[g] = { x: width / 2 + Math.cos(a) * width * 0.3, y: height / 2 + Math.sin(a) * height * 0.3 };
-      });
-      sim.force('gx', d3.forceX(d => gCenters[d.group]?.x ?? width / 2).strength(0.2));
-      sim.force('gy', d3.forceY(d => gCenters[d.group]?.y ?? height / 2).strength(0.2));
+    // payload_m mode: horizontal group bands
+    const groups = data.payload_m_mode ? [...new Set(data.nodes.map(n => n.group))] : [];
+    const groupX = {};
+    if (data.payload_m_mode && groups.length > 0) {
+      const bandW = width / groups.length;
+      groups.forEach((gr, i) => { groupX[gr] = bandW * i + bandW / 2; });
     }
 
-    // Link opacity/width by layer
+    const sim = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(links).distance(d => 20 + (1 - Math.max(d.score || 0, 0)) * 30).strength(0.4))
+      .force('charge', d3.forceManyBody().strength(-40))
+      .force('collision', d3.forceCollide().radius(d => 4 + d.layer * 2.5))
+      // Strong Y pull toward layer band
+      .force('ly', d3.forceY(d => layerY(d.layer)).strength(0.8))
+      // Horizontal: group band (payload_m) or center
+      .force('lx', d3.forceX(d =>
+        data.payload_m_mode ? (groupX[d.group] ?? width / 2) : width / 2
+      ).strength(data.payload_m_mode ? 0.3 : 0.05));
+
+    // Draw layer band labels on SVG (not in g so they don't zoom)
+    for (let l = 0; l <= maxLayer; l++) {
+      svg.append('text')
+        .attr('x', 8).attr('y', layerY(l))
+        .attr('fill', layerColors[Math.min(l, layerColors.length - 1)])
+        .attr('font-size', '10px').attr('font-family', 'Fira Code, monospace')
+        .attr('dominant-baseline', 'middle')
+        .text(`L${l}${l === maxLayer ? ' ★' : ''}`);
+
+      svg.append('line')
+        .attr('x1', 28).attr('y1', layerY(l))
+        .attr('x2', width).attr('y2', layerY(l))
+        .attr('stroke', layerColors[Math.min(l, layerColors.length - 1)])
+        .attr('stroke-opacity', 0.06)
+        .attr('stroke-width', 1)
+        .attr('stroke-dasharray', '4 4');
+    }
+
+    // Group band labels for payload_m
+    if (data.payload_m_mode) {
+      groups.forEach((gr, i) => {
+        const bandW = width / groups.length;
+        svg.append('text')
+          .attr('x', bandW * i + bandW / 2).attr('y', 14)
+          .attr('text-anchor', 'middle')
+          .attr('fill', '#4b5f82').attr('font-size', '9px')
+          .attr('font-family', 'DM Sans, sans-serif')
+          .text(gr.length > 18 ? gr.slice(0, 16) + '…' : gr);
+      });
+    }
+
+    // Link: opacity/width by layer
     const link = g.append('g').selectAll('line').data(links).join('line')
       .attr('stroke', d => layerColors[Math.min(d.layer, layerColors.length - 1)])
-      .attr('stroke-opacity', d => 0.15 + d.layer * 0.2)
-      .attr('stroke-width', d => 0.4 + d.layer * 0.5);
+      .attr('stroke-opacity', d => 0.12 + d.layer * 0.18)
+      .attr('stroke-width', d => 0.4 + d.layer * 0.6);
 
-    // Node size by layer; entry point gets white ring
+    // Node: size by layer, entry = white ring
     const node = g.append('g').selectAll('circle').data(nodes).join('circle')
       .attr('r', d => 3 + d.layer * 2.5)
       .attr('fill', d => nodeColor(d))
-      .attr('fill-opacity', d => 0.6 + d.layer * 0.1)
+      .attr('fill-opacity', d => 0.65 + d.layer * 0.1)
       .attr('stroke', d => d.is_entry ? '#fff' : 'none')
-      .attr('stroke-width', d => d.is_entry ? 2 : 0)
+      .attr('stroke-width', d => d.is_entry ? 2.5 : 0)
       .call(d3.drag()
         .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
         .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
