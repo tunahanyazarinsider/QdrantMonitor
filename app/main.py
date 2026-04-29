@@ -42,6 +42,7 @@ class QdrantConnection:
 
 
 conn = QdrantConnection()
+_graph_cache: dict[str, dict] = {}
 
 
 def _render(request: Request, template: str, ctx: dict) -> HTMLResponse:
@@ -478,6 +479,58 @@ async def search_similar(
         })
 
 
+def _compute_dist_matrix(vectors: np.ndarray, distance: str) -> np.ndarray:
+    if distance == "Cosine":
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        v = vectors / norms
+        mat = 1.0 - (v @ v.T)
+    elif distance == "Dot":
+        mat = -(vectors @ vectors.T).astype(float)
+    else:  # Euclid
+        diff = vectors[:, None, :] - vectors[None, :, :]
+        mat = np.sum(diff ** 2, axis=-1).astype(float)
+    np.fill_diagonal(mat, np.inf)
+    return mat
+
+
+def _build_hnsw(
+    ids: list[str],
+    dist_matrix: np.ndarray,
+    m: int,
+    max_layers: int = 4,
+) -> tuple[list[dict], list[dict]]:
+    n = len(ids)
+    ml = 1.0 / np.log(max(m, 2))
+    levels = np.zeros(n, dtype=int)
+    for i in range(n):
+        while np.random.random() < ml and levels[i] < max_layers:
+            levels[i] += 1
+    entry = int(np.argmax(levels))
+    nodes = [{"id": ids[i], "layer": int(levels[i]), "is_entry": i == entry} for i in range(n)]
+    links: list[dict] = []
+    seen: set[tuple] = set()
+    for layer in range(max_layers + 1):
+        mask = np.where(levels >= layer)[0]
+        if len(mask) < 2:
+            continue
+        sub = dist_matrix[np.ix_(mask, mask)]
+        k = min(m, len(mask) - 1)
+        for li in range(len(mask)):
+            gi = mask[li]
+            top_k = np.argpartition(sub[li], k)[:k]
+            for lj in top_k:
+                gj = mask[lj]
+                src, tgt = ids[gi], ids[gj]
+                edge = (min(src, tgt), max(src, tgt), layer)
+                if edge not in seen:
+                    seen.add(edge)
+                    raw = float(dist_matrix[gi, gj])
+                    score = round(1.0 - raw, 4) if raw != np.inf else 0.0
+                    links.append({"source": src, "target": tgt, "layer": layer, "score": score})
+    return nodes, links
+
+
 def _pca_2d(vectors: np.ndarray) -> np.ndarray:
     """Reduce to 2D via PCA (numpy SVD, no sklearn needed)."""
     centered = vectors - vectors.mean(axis=0)
@@ -561,21 +614,63 @@ def vectors_2d(
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+def _payload_val(payload: dict | None, field: str) -> str:
+    if not payload or not field:
+        return ""
+    v = payload.get(field)
+    if isinstance(v, list):
+        v = v[0] if v else None
+    return str(v) if v is not None else "(no value)"
+
+
 @app.get("/api/{name}/knn-graph")
 def knn_graph(
     name: str,
     sample: int = Query(80, ge=20, le=200),
-    m: int = Query(8, ge=2, le=32),
     color_field: str = Query(""),
+    refresh: bool = Query(False),
 ):
-    """Build a real KNN graph by querying Qdrant's index for each sampled node."""
+    """Build HNSW graph from actual vectors using collection's index config."""
+    cache_key = f"{name}:{sample}:{color_field}"
+    if not refresh and cache_key in _graph_cache:
+        return JSONResponse(_graph_cache[cache_key])
+
     if not conn.connected:
         return JSONResponse({"error": "Not connected"}, status_code=400)
 
     try:
         info = conn.client.get_collection(name)
         actual_points = info.points_count or 0
+        hnsw = info.config.hnsw_config
+        m = (hnsw.m if hnsw else 16) or 16
+        ef_construct = getattr(hnsw, "ef_construct", 100) if hnsw else 100
+        payload_m = getattr(hnsw, "payload_m", 0) or 0
 
+        # Distance metric + first vector name
+        vecs_cfg = info.config.params.vectors
+        if isinstance(vecs_cfg, dict):
+            vec_name = next(iter(vecs_cfg))
+            vc = vecs_cfg[vec_name]
+        else:
+            vec_name = None
+            vc = vecs_cfg
+        distance_str = (vc.distance.value if hasattr(vc.distance, "value") else str(vc.distance)) if vc else "Cosine"
+
+        # Keyword field for payload_m subgraph grouping
+        group_field = ""
+        if payload_m > 0:
+            for fname, finfo in (info.payload_schema or {}).items():
+                dtype = getattr(finfo, "data_type", None)
+                dtype_str = dtype.value if hasattr(dtype, "value") else str(dtype)
+                if dtype_str == "keyword":
+                    group_field = fname
+                    break
+
+        need_payload = bool(color_field or group_field)
+        payload_spec: list[str] | bool = [f for f in [color_field, group_field] if f] or False
+        with_vecs: bool | list[str] = True if vec_name is None else [vec_name]
+
+        # Scroll with vectors
         sampled = []
         next_off = None
         while len(sampled) < sample:
@@ -583,8 +678,8 @@ def knn_graph(
                 collection_name=name,
                 limit=min(100, sample - len(sampled)),
                 offset=next_off,
-                with_payload=True if color_field else False,
-                with_vectors=False,
+                with_payload=payload_spec if need_payload else False,
+                with_vectors=with_vecs,
             )
             if not batch:
                 break
@@ -592,55 +687,79 @@ def knn_graph(
             if next_off is None:
                 break
 
-        if len(sampled) < 2:
-            return JSONResponse({"error": "Not enough points"}, status_code=400)
+        # Extract valid vectors
+        valid_pts, valid_vecs = [], []
+        for p in sampled:
+            v = p.vector
+            if isinstance(v, dict):
+                v = v.get(vec_name) if vec_name else next(iter(v.values()), None)
+            if v is not None:
+                valid_pts.append(p)
+                valid_vecs.append(v)
 
-        sampled_id_set = set(str(p.id) for p in sampled)
+        if len(valid_pts) < 2:
+            return JSONResponse({"error": "Not enough points with vectors"}, status_code=400)
 
-        color_map: dict[str, str] = {}
-        if color_field:
-            for p in sampled:
-                val = (p.payload or {}).get(color_field)
-                if isinstance(val, list):
-                    val = val[0] if val else None
-                color_map[str(p.id)] = str(val) if val is not None else "(no value)"
+        mat = np.array(valid_vecs, dtype=np.float32)
+        ids = [str(p.id) for p in valid_pts]
+        dist_matrix = _compute_dist_matrix(mat, distance_str)
 
-        nodes = [{"id": str(p.id), "color_value": color_map.get(str(p.id), "")} for p in sampled]
-        links = []
-        seen_edges: set[tuple] = set()
+        if payload_m > 0 and group_field:
+            # Separate HNSW per payload group, use payload_m as M
+            groups: dict[str, list[int]] = {}
+            for i, p in enumerate(valid_pts):
+                gv = _payload_val(p.payload, group_field)
+                groups.setdefault(gv, []).append(i)
 
-        for pt in sampled:
-            try:
-                results = conn.client.query_points(
-                    collection_name=name,
-                    query=pt.id,
-                    limit=m + 1,
-                    with_payload=False,
-                )
-                for r in results.points:
-                    if str(r.id) == str(pt.id):
-                        continue
-                    if str(r.id) not in sampled_id_set:
-                        continue
-                    src, tgt = str(pt.id), str(r.id)
-                    edge = (min(src, tgt), max(src, tgt))
-                    if edge not in seen_edges:
-                        seen_edges.add(edge)
-                        links.append({"source": src, "target": tgt, "score": round(r.score, 4)})
-            except Exception:
-                continue
+            all_nodes: list[dict] = []
+            all_links: list[dict] = []
+            for gv, g_idxs in groups.items():
+                g_ids = [ids[i] for i in g_idxs]
+                if len(g_idxs) < 2:
+                    all_nodes.append({
+                        "id": g_ids[0], "layer": 0, "is_entry": False,
+                        "group": gv,
+                        "color_value": _payload_val(valid_pts[g_idxs[0]].payload, color_field),
+                    })
+                    continue
+                g_dist = dist_matrix[np.ix_(g_idxs, g_idxs)]
+                g_nodes, g_links = _build_hnsw(g_ids, g_dist, payload_m)
+                for nd in g_nodes:
+                    nd["group"] = gv
+                    nd["color_value"] = _payload_val(valid_pts[ids.index(nd["id"])].payload, color_field)
+                all_nodes.extend(g_nodes)
+                all_links.extend(g_links)
+            nodes, links = all_nodes, all_links
+            payload_m_mode = True
+        else:
+            nodes, links = _build_hnsw(ids, dist_matrix, m)
+            for nd in nodes:
+                i = ids.index(nd["id"])
+                nd["group"] = _payload_val(valid_pts[i].payload, group_field)
+                nd["color_value"] = _payload_val(valid_pts[i].payload, color_field)
+            payload_m_mode = False
 
-        return JSONResponse({
+        max_layer = max((nd["layer"] for nd in nodes), default=0)
+
+        result = {
             "config": {
-                "sample": len(sampled),
                 "m": m,
+                "ef_construct": ef_construct,
+                "payload_m": payload_m,
+                "distance": distance_str,
                 "actual_points": actual_points,
+                "sampled": len(valid_pts),
                 "edges": len(links),
+                "max_layer": max_layer,
             },
             "color_field": color_field,
+            "group_field": group_field,
+            "payload_m_mode": payload_m_mode,
             "nodes": nodes,
             "links": links,
-        })
+        }
+        _graph_cache[cache_key] = result
+        return JSONResponse(result)
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
 

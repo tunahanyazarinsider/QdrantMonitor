@@ -289,21 +289,12 @@
   <div id="viz-hnsw-panel">
     <div class="flex flex-wrap items-end gap-3 mb-4">
       <div>
-        <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Sample nodes</label>
+        <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Sample</label>
         <select id="hnsw-max-nodes" class="qd-select text-xs py-1.5">
           <option value="40">40</option>
           <option value="80" selected>80</option>
           <option value="150">150</option>
           <option value="200">200</option>
-        </select>
-      </div>
-      <div>
-        <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Neighbors (M)</label>
-        <select id="knn-m" class="qd-select text-xs py-1.5">
-          <option value="4">4</option>
-          <option value="8" selected>8</option>
-          <option value="12">12</option>
-          <option value="16">16</option>
         </select>
       </div>
       <div>
@@ -315,7 +306,8 @@
           {% endfor %}
         </select>
       </div>
-      <button class="qd-btn text-xs py-1.5" onclick="generateHnsw()" id="hnsw-btn">Generate</button>
+      <button class="qd-btn text-xs py-1.5" onclick="generateHnsw(false)" id="hnsw-btn">Generate</button>
+      <button class="qd-btn-ghost text-xs py-1.5" onclick="generateHnsw(true)">↺ Refresh</button>
       <div id="hnsw-spinner" class="hidden"><div class="qd-spinner"></div></div>
     </div>
 
@@ -323,8 +315,8 @@
     <div id="hnsw-legend" class="flex flex-wrap gap-3 mb-4"></div>
 
     <p class="text-[0.6875rem] text-[#4b5f82] mb-3">
-      Real KNN graph — edges derived from Qdrant's actual vector index via <code class="font-mono">query_points</code>.
-      Each node is connected to its M nearest neighbors within the sample.
+      HNSW graph built from actual vectors using collection's index config (M, distance metric, payload_m).
+      Node size = layer. Entry point highlighted. Results cached — use ↺ Refresh to rebuild.
     </p>
     <div id="hnsw-graph" class="qd-card relative" style="height: 560px; overflow: hidden;"></div>
   </div>
@@ -428,18 +420,16 @@ const PALETTE = [
   '#818cf8', '#34d399', '#fb7185', '#60a5fa', '#c084fc'
 ];
 
-async function generateHnsw() {
+async function generateHnsw(forceRefresh = false) {
   const sample = document.getElementById('hnsw-max-nodes').value;
-  const m = document.getElementById('knn-m').value;
   const colorField = document.getElementById('knn-color').value;
   const btn = document.getElementById('hnsw-btn');
   const spinner = document.getElementById('hnsw-spinner');
   btn.disabled = true; btn.textContent = 'Loading\u2026'; spinner.classList.remove('hidden');
 
   try {
-    const resp = await fetch(
-      `/api/{{ collection.name }}/knn-graph?sample=${sample}&m=${m}&color_field=${encodeURIComponent(colorField)}`
-    );
+    const url = `/api/{{ collection.name }}/knn-graph?sample=${sample}&color_field=${encodeURIComponent(colorField)}&refresh=${forceRefresh}`;
+    const resp = await fetch(url);
     const data = await resp.json();
     if (data.error) {
       document.getElementById('hnsw-graph').innerHTML =
@@ -450,34 +440,62 @@ async function generateHnsw() {
     const cfg = data.config;
     document.getElementById('hnsw-config').innerHTML = `
       <div class="qd-card p-3 text-center">
-        <div class="stat-number text-base">${cfg.sample}</div>
-        <div class="stat-label">Sampled nodes</div>
+        <div class="stat-number text-base">${cfg.m}</div>
+        <div class="stat-label">M (from config)</div>
       </div>
       <div class="qd-card p-3 text-center">
-        <div class="stat-number text-base">${cfg.m}</div>
-        <div class="stat-label">M neighbors</div>
+        <div class="stat-number text-base">${cfg.payload_m || '\u2014'}</div>
+        <div class="stat-label">payload_m</div>
+      </div>
+      <div class="qd-card p-3 text-center">
+        <div class="stat-number text-base">${cfg.max_layer}</div>
+        <div class="stat-label">Max layer</div>
+      </div>
+      <div class="qd-card p-3 text-center">
+        <div class="stat-number text-base">${cfg.sampled}</div>
+        <div class="stat-label">Sampled</div>
       </div>
       <div class="qd-card p-3 text-center">
         <div class="stat-number text-base">${cfg.edges}</div>
         <div class="stat-label">Edges</div>
       </div>
       <div class="qd-card p-3 text-center">
-        <div class="stat-number text-base">${cfg.actual_points.toLocaleString()}</div>
-        <div class="stat-label">Total points</div>
+        <div class="stat-number text-base font-mono text-[0.65rem]">${cfg.distance}</div>
+        <div class="stat-label">Distance</div>
       </div>
     `;
 
-    const uniqueVals = [...new Set(data.nodes.map(n => n.color_value).filter(v => v !== ''))];
-    const colorMap = {};
-    uniqueVals.forEach((v, i) => { colorMap[v] = PALETTE[i % PALETTE.length]; });
-    const nodeColor = (n) => n.color_value ? (colorMap[n.color_value] || '#00e5a0') : '#00e5a0';
+    // Color: by color_value if set, else by layer
+    const useColorField = data.color_field && data.nodes.some(n => n.color_value && n.color_value !== '(no value)');
+    const uniqueVals = useColorField
+      ? [...new Set(data.nodes.map(n => n.color_value).filter(v => v))]
+      : [];
+    const colorValMap = {};
+    uniqueVals.forEach((v, i) => { colorValMap[v] = PALETTE[i % PALETTE.length]; });
 
-    document.getElementById('hnsw-legend').innerHTML = uniqueVals.slice(0, 14).map((v, i) =>
-      `<span class="flex items-center gap-1.5 text-xs">
-        <span class="w-2.5 h-2.5 rounded-full" style="background:${PALETTE[i % PALETTE.length]}"></span>
-        <span class="text-[#7b8fb5]">${v}</span>
-      </span>`
-    ).join('');
+    const maxLayer = cfg.max_layer || 0;
+    const layerColors = ['#1e3a5f', '#2563eb', '#38bdf8', '#00e5a0', '#f59e0b'];
+    const nodeColor = (n) => {
+      if (useColorField && n.color_value) return colorValMap[n.color_value] || '#94a8c8';
+      return layerColors[Math.min(n.layer, layerColors.length - 1)];
+    };
+
+    // Legend: color_value legend or layer legend
+    if (useColorField) {
+      document.getElementById('hnsw-legend').innerHTML = uniqueVals.slice(0, 14).map((v, i) =>
+        `<span class="flex items-center gap-1.5 text-xs">
+          <span class="w-2.5 h-2.5 rounded-full" style="background:${PALETTE[i % PALETTE.length]}"></span>
+          <span class="text-[#7b8fb5]">${v}</span>
+        </span>`
+      ).join('');
+    } else {
+      document.getElementById('hnsw-legend').innerHTML = layerColors.slice(0, maxLayer + 1).map((c, i) =>
+        `<span class="flex items-center gap-1.5 text-xs">
+          <span class="w-2.5 h-2.5 rounded-full" style="background:${c}"></span>
+          <span class="text-[#7b8fb5]">Layer ${i}${i === maxLayer && maxLayer > 0 ? ' (entry zone)' : ''}</span>
+        </span>`
+      ).join('');
+    }
 
     const idToIdx = {};
     data.nodes.forEach((n, i) => { idToIdx[n.id] = i; });
@@ -491,31 +509,44 @@ async function generateHnsw() {
       .attr('width', width).attr('height', height)
       .style('background', '#0a0e17');
     const g = svg.append('g');
-
-    svg.call(d3.zoom().scaleExtent([0.2, 6]).on('zoom', (e) => {
-      g.attr('transform', e.transform);
-    }));
+    svg.call(d3.zoom().scaleExtent([0.15, 8]).on('zoom', (e) => g.attr('transform', e.transform)));
 
     const nodes = data.nodes.map(n => ({ ...n }));
     const links = data.links
-      .map(l => ({ source: idToIdx[l.source], target: idToIdx[l.target], score: l.score }))
+      .map(l => ({ source: idToIdx[l.source], target: idToIdx[l.target], layer: l.layer, score: l.score }))
       .filter(l => l.source !== undefined && l.target !== undefined);
 
+    // Group separation for payload_m mode
     const sim = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink(links).distance(d => 20 + (1 - (d.score || 0.5)) * 40).strength(0.5))
-      .force('charge', d3.forceManyBody().strength(-25))
+      .force('link', d3.forceLink(links).distance(d => 15 + (1 - Math.max(d.score || 0, 0)) * 30).strength(0.6))
+      .force('charge', d3.forceManyBody().strength(-30))
       .force('center', d3.forceCenter(width / 2, height / 2))
-      .force('collision', d3.forceCollide().radius(5));
+      .force('collision', d3.forceCollide().radius(d => 3 + d.layer * 2));
 
+    if (data.payload_m_mode) {
+      const groups = [...new Set(data.nodes.map(n => n.group))];
+      const gCenters = {};
+      groups.forEach((g, i) => {
+        const a = (2 * Math.PI * i) / groups.length;
+        gCenters[g] = { x: width / 2 + Math.cos(a) * width * 0.3, y: height / 2 + Math.sin(a) * height * 0.3 };
+      });
+      sim.force('gx', d3.forceX(d => gCenters[d.group]?.x ?? width / 2).strength(0.2));
+      sim.force('gy', d3.forceY(d => gCenters[d.group]?.y ?? height / 2).strength(0.2));
+    }
+
+    // Link opacity/width by layer
     const link = g.append('g').selectAll('line').data(links).join('line')
-      .attr('stroke', '#1e3a5f')
-      .attr('stroke-opacity', d => 0.3 + (d.score || 0.5) * 0.5)
-      .attr('stroke-width', d => 0.5 + (d.score || 0.5) * 1.5);
+      .attr('stroke', d => layerColors[Math.min(d.layer, layerColors.length - 1)])
+      .attr('stroke-opacity', d => 0.15 + d.layer * 0.2)
+      .attr('stroke-width', d => 0.4 + d.layer * 0.5);
 
+    // Node size by layer; entry point gets white ring
     const node = g.append('g').selectAll('circle').data(nodes).join('circle')
-      .attr('r', 5)
+      .attr('r', d => 3 + d.layer * 2.5)
       .attr('fill', d => nodeColor(d))
-      .attr('fill-opacity', 0.8)
+      .attr('fill-opacity', d => 0.6 + d.layer * 0.1)
+      .attr('stroke', d => d.is_entry ? '#fff' : 'none')
+      .attr('stroke-width', d => d.is_entry ? 2 : 0)
       .call(d3.drag()
         .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
         .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
@@ -530,10 +561,12 @@ async function generateHnsw() {
       .style('color', '#d0dce8').style('opacity', 0).style('z-index', 10);
 
     node.on('mouseover', (e, d) => {
-      tooltip.style('opacity', 1)
-        .html(`ID: <span style="color:#00e5a0">${d.id}</span>${d.color_value ? `<br>${data.color_field}: ${d.color_value}` : ''}`)
-        .style('left', (e.offsetX + 12) + 'px').style('top', (e.offsetY - 10) + 'px');
-    }).on('mouseout', () => { tooltip.style('opacity', 0); });
+      tooltip.style('opacity', 1).html(
+        `ID: <span style="color:#00e5a0">${d.id}</span><br>Layer: ${d.layer}${d.is_entry ? ' \u2605 entry' : ''}` +
+        (d.group ? `<br>group: ${d.group}` : '') +
+        (d.color_value ? `<br>${data.color_field}: ${d.color_value}` : '')
+      ).style('left', (e.offsetX + 12) + 'px').style('top', (e.offsetY - 10) + 'px');
+    }).on('mouseout', () => tooltip.style('opacity', 0));
 
     sim.on('tick', () => {
       link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
