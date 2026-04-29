@@ -679,78 +679,154 @@ def knn_graph(
         need_payload = bool(color_field or group_field)
         payload_spec: list[str] | bool = [f for f in [color_field, group_field] if f] or False
 
-        # Scroll with ALL vectors — auto-detect which named vector actually has data
-        sampled = []
-        next_off = None
-        while len(sampled) < sample:
-            batch, next_off = conn.client.scroll(
+        def _scroll_batch(scroll_filter=None, limit=100, offset=None):
+            return conn.client.scroll(
                 collection_name=name,
-                limit=min(100, sample - len(sampled)),
-                offset=next_off,
+                scroll_filter=scroll_filter,
+                limit=limit,
+                offset=offset,
                 with_payload=payload_spec if need_payload else False,
                 with_vectors=True,
             )
-            if not batch:
-                break
-            sampled.extend(batch)
-            if next_off is None:
-                break
 
-        # Extract valid dense vectors, auto-detecting which named vector has data.
-        # Collections can have defined-but-unpopulated named vectors; we pick the first
-        # that actually returns list data, preferring the config-selected vec_name.
-        valid_pts, valid_vecs = [], []
-        detected_vec_name: str | None = None
-        for p in sampled:
-            v = p.vector
-            chosen = None
-            if isinstance(v, dict):
-                # Try config-selected name first, then any dense (list) vector
-                candidates = ([vec_name] if vec_name and vec_name in v else []) + [
-                    vn for vn in v if vn != vec_name
-                ]
-                for cname in candidates:
-                    val = v[cname]
-                    if isinstance(val, list) and len(val) > 0:
-                        chosen = val
-                        if detected_vec_name is None:
-                            detected_vec_name = cname
-                            # Update distance_str for the actually-used vector
-                            if isinstance(vecs_cfg, dict) and cname in vecs_cfg:
-                                _vc2 = vecs_cfg[cname]
-                                distance_str = (
-                                    _vc2.distance.value
-                                    if hasattr(_vc2.distance, "value")
-                                    else str(_vc2.distance)
-                                )
+        def _extract_valid(pts, preferred_vec_name):
+            """Return (valid_pts, valid_vecs, detected_vec_name)."""
+            out_pts, out_vecs = [], []
+            detected = None
+            for p in pts:
+                v = p.vector
+                chosen = None
+                if isinstance(v, dict):
+                    candidates = (
+                        ([preferred_vec_name] if preferred_vec_name and preferred_vec_name in v else [])
+                        + [vn for vn in v if vn != preferred_vec_name]
+                    )
+                    for cname in candidates:
+                        val = v[cname]
+                        if isinstance(val, list) and len(val) > 0:
+                            chosen = val
+                            if detected is None:
+                                detected = cname
+                            break
+                elif isinstance(v, list) and len(v) > 0:
+                    chosen = v
+                if chosen is not None:
+                    out_pts.append(p)
+                    out_vecs.append(chosen)
+            return out_pts, out_vecs, detected
+
+        if payload_m > 0 and group_field:
+            # payload_m collection: Qdrant builds a separate HNSW per keyword value.
+            # Reproduce this by sampling proportionally per group and building
+            # disconnected sub-HNSWs. We discover groups first via a quick probe.
+            from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+            probe, _ = conn.client.scroll(
+                collection_name=name,
+                limit=300,
+                with_payload=[group_field],
+                with_vectors=False,
+            )
+            group_vals = list({_payload_val(p.payload, group_field) for p in probe})
+            group_vals = [v for v in group_vals if v and v != "(no value)"][:30]
+
+            per_group = max(sample // max(len(group_vals), 1), effective_m * 2 + 2)
+
+            sampled_all: list = []
+            for gv in group_vals:
+                g_batch: list = []
+                nxt = None
+                while len(g_batch) < per_group:
+                    b, nxt = conn.client.scroll(
+                        collection_name=name,
+                        scroll_filter=Filter(must=[FieldCondition(key=group_field, match=MatchValue(value=gv))]),
+                        limit=min(50, per_group - len(g_batch)),
+                        offset=nxt,
+                        with_payload=payload_spec if need_payload else False,
+                        with_vectors=True,
+                    )
+                    if not b:
                         break
-            elif isinstance(v, list) and len(v) > 0:
-                chosen = v
-            if chosen is not None:
-                valid_pts.append(p)
-                valid_vecs.append(chosen)
+                    g_batch.extend(b)
+                    if nxt is None:
+                        break
+                sampled_all.extend(g_batch[:per_group])
 
-        if detected_vec_name:
-            vec_name = detected_vec_name
+            valid_pts, valid_vecs, det = _extract_valid(sampled_all, vec_name)
+            if det:
+                vec_name = det
+                if isinstance(vecs_cfg, dict) and det in vecs_cfg:
+                    _vc2 = vecs_cfg[det]
+                    distance_str = (_vc2.distance.value if hasattr(_vc2.distance, "value") else str(_vc2.distance))
 
-        if len(valid_pts) < 2:
-            return JSONResponse({"error": "Not enough points with vectors"}, status_code=400)
+            if len(valid_pts) < 2:
+                return JSONResponse({"error": "Not enough points with vectors"}, status_code=400)
 
-        mat = np.array(valid_vecs, dtype=np.float32)
-        ids = [str(p.id) for p in valid_pts]
-        dist_matrix = _compute_dist_matrix(mat, distance_str)
+            mat = np.array(valid_vecs, dtype=np.float32)
+            ids = [str(p.id) for p in valid_pts]
+            dist_matrix = _compute_dist_matrix(mat, distance_str)
+            id_to_idx = {sid: i for i, sid in enumerate(ids)}
 
-        # Always build one HNSW for all sampled nodes.
-        # Splitting by group_field creates tiny sub-graphs when payload fields are
-        # high-cardinality, leaving most nodes at layer=0 with 0 edges.
-        # payload_m_mode only controls the D3 horizontal band layout.
-        id_to_idx = {sid: i for i, sid in enumerate(ids)}
-        nodes, links = _build_hnsw(ids, dist_matrix, effective_m)
-        for nd in nodes:
-            i = id_to_idx[nd["id"]]
-            nd["group"] = _payload_val(valid_pts[i].payload, group_field)
-            nd["color_value"] = _payload_val(valid_pts[i].payload, color_field)
-        payload_m_mode = bool(payload_m > 0 and group_field)
+            # Group indices for per-group HNSW
+            groups_idx: dict[str, list[int]] = {}
+            for i, p in enumerate(valid_pts):
+                gv = _payload_val(p.payload, group_field)
+                groups_idx.setdefault(gv, []).append(i)
+
+            all_nodes: list[dict] = []
+            all_links: list[dict] = []
+            for gv, g_idxs in groups_idx.items():
+                if len(g_idxs) < 2:
+                    all_nodes.append({
+                        "id": ids[g_idxs[0]], "layer": 0, "is_entry": False,
+                        "group": gv,
+                        "color_value": _payload_val(valid_pts[g_idxs[0]].payload, color_field),
+                    })
+                    continue
+                g_dist = dist_matrix[np.ix_(g_idxs, g_idxs)]
+                g_ids = [ids[i] for i in g_idxs]
+                g_nodes, g_links = _build_hnsw(g_ids, g_dist, effective_m)
+                for nd in g_nodes:
+                    nd["group"] = gv
+                    nd["color_value"] = _payload_val(valid_pts[id_to_idx[nd["id"]]].payload, color_field)
+                all_nodes.extend(g_nodes)
+                all_links.extend(g_links)
+
+            nodes, links = all_nodes, all_links
+            payload_m_mode = True
+        else:
+            # Global HNSW: scroll sequentially
+            sampled: list = []
+            nxt = None
+            while len(sampled) < sample:
+                b, nxt = _scroll_batch(limit=min(100, sample - len(sampled)), offset=nxt)
+                if not b:
+                    break
+                sampled.extend(b)
+                if nxt is None:
+                    break
+
+            valid_pts, valid_vecs, det = _extract_valid(sampled, vec_name)
+            if det:
+                vec_name = det
+                if isinstance(vecs_cfg, dict) and det in vecs_cfg:
+                    _vc2 = vecs_cfg[det]
+                    distance_str = (_vc2.distance.value if hasattr(_vc2.distance, "value") else str(_vc2.distance))
+
+            if len(valid_pts) < 2:
+                return JSONResponse({"error": "Not enough points with vectors"}, status_code=400)
+
+            mat = np.array(valid_vecs, dtype=np.float32)
+            ids = [str(p.id) for p in valid_pts]
+            dist_matrix = _compute_dist_matrix(mat, distance_str)
+            id_to_idx = {sid: i for i, sid in enumerate(ids)}
+
+            nodes, links = _build_hnsw(ids, dist_matrix, effective_m)
+            for nd in nodes:
+                i = id_to_idx[nd["id"]]
+                nd["group"] = _payload_val(valid_pts[i].payload, group_field)
+                nd["color_value"] = _payload_val(valid_pts[i].payload, color_field)
+            payload_m_mode = False
 
         max_layer = max((nd["layer"] for nd in nodes), default=0)
 
