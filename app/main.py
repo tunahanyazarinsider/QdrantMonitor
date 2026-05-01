@@ -4,21 +4,39 @@ import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 import numpy as np
-from fastapi import FastAPI, Form, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, File, Form, Query, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from qdrant_client import QdrantClient
 
 BASE_DIR = Path(__file__).resolve().parent
+_CONN_STATE_FILE = BASE_DIR.parent / ".qdrant_conn.json"
+
+
+def _load_conn_state() -> tuple[str, int]:
+    try:
+        data = json.loads(_CONN_STATE_FILE.read_text())
+        return str(data.get("host", "localhost")), int(data.get("port", 6333))
+    except Exception:
+        return "localhost", 6333
+
+
+def _save_conn_state(host: str, port: int) -> None:
+    try:
+        _CONN_STATE_FILE.write_text(json.dumps({"host": host, "port": port}))
+    except Exception:
+        pass
 
 
 # ── Connection state ─────────────────────────────────────────────────
 class QdrantConnection:
     def __init__(self) -> None:
-        self.host: str = "localhost"
-        self.port: int = 6333
+        h, p = _load_conn_state()
+        self.host: str = h
+        self.port: int = p
         self.client: QdrantClient | None = None
         self.connected: bool = False
         self.error: str = ""
@@ -35,6 +53,7 @@ class QdrantConnection:
             self.client.get_collections()
             self.connected = True
             self.error = ""
+            _save_conn_state(self.host, self.port)
         except Exception as exc:
             self.connected = False
             self.client = None
@@ -214,6 +233,108 @@ async def api_connect(
     port: int = Form(6333),
 ):
     conn.connect(host, port)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/api/collections/create")
+async def api_create_collection(
+    name: str = Form(...),
+    vector_size: int = Form(...),
+    distance: str = Form("Cosine"),
+    vector_name: str = Form(""),
+    on_disk: bool = Form(False),
+):
+    if not conn.connected:
+        return JSONResponse({"error": "Not connected"}, status_code=400)
+    distance = distance.capitalize()
+    if distance not in {"Cosine", "Dot", "Euclid", "Manhattan"}:
+        return JSONResponse(
+            {"error": f"Invalid distance: {distance}"}, status_code=400
+        )
+    vec_cfg = {"size": vector_size, "distance": distance, "on_disk": on_disk}
+    body: dict = {"vectors": {vector_name: vec_cfg} if vector_name else vec_cfg}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.put(
+                f"http://{conn.host}:{conn.port}/collections/{name}",
+                json=body,
+            )
+        if resp.status_code >= 400:
+            return JSONResponse(
+                {"error": f"{resp.status_code}: {resp.text[:300]}"},
+                status_code=400,
+            )
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/api/collections/restore-from-snapshot")
+async def api_restore_new_collection(
+    request: Request,
+    name: str = Form(...),
+    snapshot_file: UploadFile = File(...),
+    priority: str = Form("snapshot"),
+):
+    if not conn.connected:
+        return JSONResponse({"error": "Not connected"}, status_code=400)
+    import tempfile
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".snapshot") as tmp:
+            tmp_path = Path(tmp.name)
+            while True:
+                chunk = await snapshot_file.read(1 << 20)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        url = (
+            f"{_qdrant_base_url()}/collections/{name}"
+            f"/snapshots/upload?priority={priority}"
+        )
+        async with httpx.AsyncClient(timeout=None) as client:
+            with tmp_path.open("rb") as f:
+                files = {
+                    "snapshot": (
+                        snapshot_file.filename or "upload.snapshot",
+                        f,
+                        "application/octet-stream",
+                    )
+                }
+                resp = await client.post(url, files=files)
+        if resp.status_code >= 400:
+            return JSONResponse(
+                {"error": f"{resp.status_code}: {resp.text[:400]}"},
+                status_code=400,
+            )
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/api/collections/{name}/delete")
+async def api_delete_collection(name: str):
+    if not conn.connected:
+        return JSONResponse({"error": "Not connected"}, status_code=400)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.delete(
+                f"http://{conn.host}:{conn.port}/collections/{name}"
+            )
+        if resp.status_code >= 400:
+            return JSONResponse(
+                {"error": f"{resp.status_code}: {resp.text[:300]}"},
+                status_code=400,
+            )
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
     return RedirectResponse(url="/", status_code=303)
 
 
@@ -448,9 +569,52 @@ async def search_similar(
         })
     parsed = _parse_id(point_id.strip())
     try:
+        existing = conn.client.retrieve(
+            collection_name=name,
+            ids=[parsed],
+            with_payload=False,
+            with_vectors=True,
+        )
+        if not existing:
+            return _render(request, "partials/search_similar_result.html", {
+                "results": [],
+                "error": f"Point ID {point_id} not found in collection",
+                "query_id": point_id,
+            })
+        vec = existing[0].vector
+        query_vector: list[float] | None = None
+        if isinstance(vec, dict):
+            if vector_name and vector_name not in vec:
+                return _render(request, "partials/search_similar_result.html", {
+                    "results": [],
+                    "error": f"Point has no vector named '{vector_name}'. Available: {list(vec.keys())}",
+                    "query_id": point_id,
+                })
+            if vector_name and vec.get(vector_name):
+                query_vector = list(vec[vector_name])
+            else:
+                for k, v in vec.items():
+                    if v:
+                        vector_name = k
+                        query_vector = list(v)
+                        break
+            if query_vector is None:
+                return _render(request, "partials/search_similar_result.html", {
+                    "results": [],
+                    "error": "Point has no populated named vectors",
+                    "query_id": point_id,
+                })
+        elif vec is None:
+            return _render(request, "partials/search_similar_result.html", {
+                "results": [],
+                "error": "Point exists but has no vector data",
+                "query_id": point_id,
+            })
+        else:
+            query_vector = list(vec)
         results = conn.client.query_points(
             collection_name=name,
-            query=parsed,
+            query=query_vector,
             using=vector_name if vector_name else None,
             limit=limit,
             with_payload=True,
@@ -993,6 +1157,247 @@ def hnsw_graph(
         })
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ── Snapshots ────────────────────────────────────────────────────────
+def _qdrant_base_url() -> str:
+    return f"http://{conn.host}:{conn.port}"
+
+
+def _snapshot_url(name: str, snap_name: str) -> str:
+    return f"{_qdrant_base_url()}/collections/{name}/snapshots/{snap_name}"
+
+
+async def _list_snaps_raw(name: str) -> list[dict]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{_qdrant_base_url()}/collections/{name}/snapshots")
+        resp.raise_for_status()
+        data = resp.json()
+    rows = []
+    for s in data.get("result", []) or []:
+        rows.append({
+            "name": s.get("name"),
+            "size": s.get("size"),
+            "creation_time": s.get("creation_time"),
+            "checksum": s.get("checksum"),
+        })
+    rows.sort(key=lambda r: r.get("creation_time") or "", reverse=True)
+    return rows
+
+
+@app.get("/api/{name}/snapshots", response_class=HTMLResponse)
+async def list_snapshots(request: Request, name: str):
+    if not conn.connected:
+        return HTMLResponse("<p class='text-red-400 p-4 text-xs'>Not connected</p>")
+    try:
+        rows = await _list_snaps_raw(name)
+        return _render(request, "partials/snapshots_list.html", {
+            "snapshots": rows,
+            "collection_name": name,
+            "error": "",
+        })
+    except Exception as exc:
+        return _render(request, "partials/snapshots_list.html", {
+            "snapshots": [],
+            "collection_name": name,
+            "error": str(exc),
+        })
+
+
+@app.post("/api/{name}/snapshots/create", response_class=HTMLResponse)
+async def create_snapshot(request: Request, name: str):
+    if not conn.connected:
+        return HTMLResponse("<p class='text-red-400 p-4 text-xs'>Not connected</p>")
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            resp = await client.post(
+                f"{_qdrant_base_url()}/collections/{name}/snapshots"
+            )
+        if resp.status_code >= 400:
+            return _render(request, "partials/snapshots_list.html", {
+                "snapshots": await _list_snaps_raw(name),
+                "collection_name": name,
+                "error": f"Create failed: {resp.status_code} {resp.text[:300]}",
+            })
+    except Exception as exc:
+        return _render(request, "partials/snapshots_list.html", {
+            "snapshots": [],
+            "collection_name": name,
+            "error": f"Create failed: {exc}",
+        })
+    return await list_snapshots(request, name)
+
+
+@app.post("/api/{name}/snapshots/{snap_name}/delete", response_class=HTMLResponse)
+async def delete_snapshot(request: Request, name: str, snap_name: str):
+    if not conn.connected:
+        return HTMLResponse("<p class='text-red-400 p-4 text-xs'>Not connected</p>")
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.delete(_snapshot_url(name, snap_name))
+        if resp.status_code >= 400:
+            return _render(request, "partials/snapshots_list.html", {
+                "snapshots": await _list_snaps_raw(name),
+                "collection_name": name,
+                "error": f"Delete failed: {resp.status_code} {resp.text[:300]}",
+            })
+    except Exception as exc:
+        return _render(request, "partials/snapshots_list.html", {
+            "snapshots": [],
+            "collection_name": name,
+            "error": f"Delete failed: {exc}",
+        })
+    return await list_snapshots(request, name)
+
+
+@app.get("/api/{name}/snapshots/{snap_name}/download")
+async def download_snapshot(name: str, snap_name: str):
+    if not conn.connected:
+        return JSONResponse({"error": "Not connected"}, status_code=400)
+    url = _snapshot_url(name, snap_name)
+
+    async def stream():
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("GET", url) as resp:
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    raise RuntimeError(f"Qdrant {resp.status_code}: {body.decode(errors='replace')}")
+                async for chunk in resp.aiter_bytes(chunk_size=1 << 20):
+                    yield chunk
+
+    return StreamingResponse(
+        stream(),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{snap_name}"'},
+    )
+
+
+@app.post("/api/{name}/snapshots/{snap_name}/save", response_class=HTMLResponse)
+async def save_snapshot_to_path(
+    request: Request,
+    name: str,
+    snap_name: str,
+    dest_path: str = Form(...),
+):
+    if not conn.connected:
+        return HTMLResponse("<p class='text-red-400 p-2 text-xs'>Not connected</p>")
+    dest = Path(dest_path).expanduser()
+    if dest.is_dir() or dest_path.endswith("/"):
+        dest = dest / snap_name
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return HTMLResponse(
+            f"<p class='text-red-400 p-2 text-xs'>Cannot create dir: {exc}</p>"
+        )
+    url = _snapshot_url(name, snap_name)
+    try:
+        bytes_written = 0
+        with dest.open("wb") as f:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", url) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        return HTMLResponse(
+                            f"<p class='text-red-400 p-2 text-xs'>Qdrant {resp.status_code}: "
+                            f"{body.decode(errors='replace')[:200]}</p>"
+                        )
+                    async for chunk in resp.aiter_bytes(chunk_size=1 << 20):
+                        f.write(chunk)
+                        bytes_written += len(chunk)
+        return HTMLResponse(
+            f"<p class='text-[#00e5a0] p-2 text-xs'>Saved {bytes_written:,} bytes → "
+            f"<span class='font-mono'>{dest}</span></p>"
+        )
+    except Exception as exc:
+        return HTMLResponse(
+            f"<p class='text-red-400 p-2 text-xs'>Save failed: {exc}</p>"
+        )
+
+
+@app.post("/api/{name}/snapshots/upload-restore", response_class=HTMLResponse)
+async def restore_from_upload(
+    request: Request,
+    name: str,
+    snapshot_file: UploadFile = File(...),
+    priority: str = Form("snapshot"),
+):
+    if not conn.connected:
+        return HTMLResponse("<p class='text-red-400 p-2 text-xs'>Not connected</p>")
+    import tempfile
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".snapshot") as tmp:
+            tmp_path = Path(tmp.name)
+            while True:
+                chunk = await snapshot_file.read(1 << 20)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        url = f"{_qdrant_base_url()}/collections/{name}/snapshots/upload?priority={priority}"
+        async with httpx.AsyncClient(timeout=None) as client:
+            with tmp_path.open("rb") as f:
+                files = {
+                    "snapshot": (
+                        snapshot_file.filename or "upload.snapshot",
+                        f,
+                        "application/octet-stream",
+                    )
+                }
+                resp = await client.post(url, files=files)
+        if resp.status_code >= 400:
+            return HTMLResponse(
+                f"<p class='text-red-400 p-2 text-xs'>Upload failed: "
+                f"{resp.status_code} {resp.text[:400]}</p>"
+            )
+        return HTMLResponse(
+            f"<p class='text-[#00e5a0] p-2 text-xs'>Restored from "
+            f"<span class='font-mono'>{snapshot_file.filename}</span> into "
+            f"<span class='font-mono'>{name}</span></p>"
+        )
+    except Exception as exc:
+        return HTMLResponse(
+            f"<p class='text-red-400 p-2 text-xs'>Restore failed: {exc}</p>"
+        )
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+
+@app.post("/api/{name}/snapshots/recover-url", response_class=HTMLResponse)
+async def restore_from_url(
+    request: Request,
+    name: str,
+    location: str = Form(...),
+    priority: str = Form("snapshot"),
+):
+    if not conn.connected:
+        return HTMLResponse("<p class='text-red-400 p-2 text-xs'>Not connected</p>")
+    try:
+        url = f"{_qdrant_base_url()}/collections/{name}/snapshots/recover"
+        async with httpx.AsyncClient(timeout=None) as client:
+            resp = await client.put(
+                url,
+                json={"location": location, "priority": priority},
+            )
+        if resp.status_code >= 400:
+            return HTMLResponse(
+                f"<p class='text-red-400 p-2 text-xs'>Recover failed: "
+                f"{resp.status_code} {resp.text[:400]}</p>"
+            )
+        return HTMLResponse(
+            f"<p class='text-[#00e5a0] p-2 text-xs'>Recovered from "
+            f"<span class='font-mono'>{location}</span> into "
+            f"<span class='font-mono'>{name}</span></p>"
+        )
+    except Exception as exc:
+        return HTMLResponse(
+            f"<p class='text-red-400 p-2 text-xs'>Recover failed: {exc}</p>"
+        )
 
 
 # ── Entry point ──────────────────────────────────────────────────────

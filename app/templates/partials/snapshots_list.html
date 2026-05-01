@@ -1,0 +1,61 @@
+{% if error %}
+<p class="text-[#f87171] text-xs p-2 mb-3">{{ error }}</p>
+{% endif %}
+
+{% if not snapshots %}
+<p class="text-[#4b5f82] text-sm p-4">No snapshots yet. Click "Create Snapshot" to make one.</p>
+{% else %}
+<div class="overflow-x-auto">
+  <table class="qd-table w-full text-xs">
+    <thead>
+      <tr>
+        <th class="text-left px-3 py-2">Name</th>
+        <th class="text-left px-3 py-2">Size</th>
+        <th class="text-left px-3 py-2">Created</th>
+        <th class="text-left px-3 py-2">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in snapshots %}
+      <tr class="border-t border-[#1a2236]">
+        <td class="px-3 py-2 font-mono text-[#38bdf8] break-all">{{ s.name }}</td>
+        <td class="px-3 py-2 font-mono text-[#7b8fb5]">
+          {% if s.size %}{{ '{:,}'.format(s.size) }} B{% else %}—{% endif %}
+        </td>
+        <td class="px-3 py-2 font-mono text-[#7b8fb5]">{{ s.creation_time or '—' }}</td>
+        <td class="px-3 py-2">
+          <div class="flex flex-wrap items-center gap-2">
+            <a href="/api/{{ collection_name }}/snapshots/{{ s.name }}/download"
+               class="qd-btn-ghost text-[0.6875rem] py-1 px-2"
+               download>Download</a>
+
+            <form hx-post="/api/{{ collection_name }}/snapshots/{{ s.name }}/save"
+                  hx-target="#save-result-{{ loop.index }}"
+                  hx-swap="innerHTML"
+                  class="flex items-center gap-1">
+              <input name="dest_path" type="text"
+                     placeholder="/abs/path/dir or file"
+                     class="qd-input text-[0.6875rem] py-1 w-64" required>
+              <button type="submit" class="qd-btn-ghost text-[0.6875rem] py-1 px-2">
+                Save to path
+              </button>
+            </form>
+
+            <form hx-post="/api/{{ collection_name }}/snapshots/{{ s.name }}/delete"
+                  hx-target="#snapshots-list"
+                  hx-swap="innerHTML"
+                  hx-confirm="Delete snapshot {{ s.name }}?">
+              <button type="submit"
+                      class="qd-btn-ghost text-[0.6875rem] py-1 px-2 text-[#f87171] border-[#f87171]">
+                Delete
+              </button>
+            </form>
+          </div>
+          <div id="save-result-{{ loop.index }}"></div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
