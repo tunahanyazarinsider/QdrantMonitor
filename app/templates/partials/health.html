@@ -368,8 +368,8 @@
 <!-- ── Segments ── -->
 <section class="qd-card p-5 mb-5" id="health-segments">
   <h2 class="hud-title">Segments <span class="hud-sub">state, index coverage, storage and config drift per segment</span></h2>
-  <div id="segments-content" hx-get="/api/{{ collection_name }}/segments" hx-trigger="load" hx-swap="innerHTML">
-    <div class="flex items-center gap-3 py-6 text-xs text-[#94a8c8]"><div class="qd-spinner"></div>Reading segment telemetry…</div>
+  <div id="segments-content">
+    {% with errors=[], peer=self_id, peers=seg_peers %}{% include "partials/segments.html" %}{% endwith %}
   </div>
 </section>
 

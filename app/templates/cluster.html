@@ -101,7 +101,7 @@
           {% set ok = v.active == v.replicas and not v.disagree %}
           <div class="flex items-center gap-1.5">
             <span class="tier {{ 'tier-cached' if ok else 'tier-pinned' }}">{{ '●' if ok else '▲' }}
-              {% if v.replicas > 1 %}{{ v.active }}/{{ v.replicas }} Active{% else %}{{ v.worst_state or ('Active' if ok else 'disputed') }}{% endif %}
+              {% if v.replicas > 1 %}{{ v.active }}/{{ v.replicas }} Active{% else %}{{ v.worst_state or ('Active' if ok else ('disputed' if v.disagree else 'unverified')) }}{% endif %}
             </span>
             {% if v.status and v.status != 'green' %}
             <span class="badge {{ 'badge-red' if v.status == 'red' else ('badge-yellow' if v.status == 'yellow' else 'badge-blue') }}" title="{{ status_meaning.get(v.status, '') }}">{{ v.status }}</span>

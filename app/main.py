@@ -448,21 +448,15 @@ async def api_delete_collection(name: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    collections: list[dict] = []
-    total_points = 0
-    if conn.connected:
-        try:
-            for c in conn.client.get_collections().collections:
-                s = _collection_summary(c.name)
-                collections.append(s)
-                total_points += s["points_count"]
-        except Exception:
-            conn.connected = False
-    return _render(request, "dashboard.html", {
-        "collections": collections,
-        "total_points": total_points,
-        "conn": conn,
-    })
+    if not conn.connected:
+        return _render(request, "dashboard.html", {"collections": [], "total_points": 0, "conn": conn, "health": []})
+    state = await _cluster_state(request)
+    for row in state["collections"]:
+        mx = row.get("replicas") or {}
+        row["cluster_points"] = sum(sh["max_points"] for sh in mx.get("shards") or [] if sh["max_points"] is not None) \
+            if mx.get("shards") else row["points"]
+    state["total_points"] = sum(r["cluster_points"] for r in state["collections"])
+    return _render(request, "dashboard.html", state)
 
 
 @app.get("/collection/{name}", response_class=HTMLResponse)
@@ -1466,9 +1460,10 @@ def _d(v) -> dict:
     return v if isinstance(v, dict) else {}
 
 
-def _cluster_shards(cluster_telemetry, collection: str) -> list:
-    """Per-replica state and size of every peer, as gathered by the connected node."""
-    return _d(_d(_d(cluster_telemetry).get("collections")).get(collection)).get("shards") or []
+def _cluster_shards(cluster_telemetry, collection: str) -> list | None:
+    """Per-replica state and size of every peer, as gathered by the connected node; None if unavailable."""
+    entry = _d(_d(cluster_telemetry).get("collections")).get(collection)
+    return _d(entry).get("shards") if isinstance(entry, dict) and "shards" in entry else None
 
 
 def _normalize_url(raw: str) -> str:
@@ -1515,9 +1510,12 @@ async def _replica_views(client: httpx.AsyncClient, bases: dict[str, str | None]
         for c in _d(_d(tele).get("collections")).get("collections") or []:
             if c.get("id") == collection:
                 remote_stats[pid] = [r for s in c.get("shards") or [] for r in s.get("remote") or []]
+                own = str(pid)
+                if own in ("", "local") and len(views) == 1:
+                    own = next(iter(views))
                 for s in c.get("shards") or []:
                     if _d(s.get("local")).get("status"):
-                        local_status[(s.get("id"), str(pid))] = s["local"]["status"]
+                        local_status[(s.get("id"), own)] = s["local"]["status"]
     return views, remote_stats, errors, local_status
 
 
@@ -1583,10 +1581,8 @@ async def api_peers_discover():
     return RedirectResponse(url=f"/cluster?msg={quote(msg)}", status_code=303)
 
 
-@app.get("/cluster", response_class=HTMLResponse)
-async def cluster_page(request: Request):
-    if not conn.connected:
-        return RedirectResponse(url="/")
+async def _cluster_state(request: Request) -> dict:
+    """Everything the cluster page and the overview show; all Qdrant calls run in parallel."""
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=2.0)) as client:
         (tele, e1), (clus, e2), (cltele, e3), (quotas, e4), (issues, e5), (metrics_txt, e6), \
             (healthz, _), (readyz, e8), (snaps, e9) = await asyncio.gather(
@@ -1655,7 +1651,7 @@ async def cluster_page(request: Request):
     stale = {pid: v["error"] for pid, v in peer_live.items() if v["error"] and "now serves peer" in v["error"]}
     errors_extra = list(stale.values())
     mem_by_coll = {cid: _d(m) for cid, (m, _) in zip(coll_ids, mem_results)}
-    errors = [e for e in (e1, e2, e3, e4, e5, e6, e8, e9, e10) if e] + errors_extra
+    errors = [e for e in (e1, e2, e3, e4, e5, e6, e8, e9, e10) if e] + errors_extra + [e for _, e in info_results if e][:3]
     version = tuple(int(x) for x in re.findall(r"\d+", str(_d(tele.get("app")).get("version") or ""))[:2]) or (0, 0)
     mem_supported = version >= (1, 18)
     mem_errors = [e for _, e in mem_results if e] if mem_supported else []
@@ -1700,6 +1696,16 @@ async def cluster_page(request: Request):
             "hw": _d(hw.get(c.get("id"))),
             "replicas": replicas_by_coll.get(c.get("id")),
             "coll_status": info_by_coll.get(c.get("id"), {}).get("status"),
+            "info_error": next((e for (r, e), cid2 in zip(info_results, coll_ids) if cid2 == c.get("id") and e), None),
+            "indexed_vectors": info_by_coll.get(c.get("id"), {}).get("indexed_vectors_count"),
+            "segments_count": info_by_coll.get(c.get("id"), {}).get("segments_count"),
+            "vectors_total": sum(nbyname.values()) if nbyname else None,
+            "vec_names": [
+                {"name": n or "(default)", "size": _d(v).get("size"), "distance": _d(v).get("distance")}
+                for n, v in (({"": cfg_params.get("vectors")} if "size" in _d(cfg_params.get("vectors"))
+                              else _d(cfg_params.get("vectors"))).items())
+            ],
+            "sparse_names": list(_d(cfg_params.get("sparse_vectors"))),
             "optimizer_error": insights.optimizer_error(info_by_coll.get(c.get("id"), {}).get("optimizer_status")),
             "optimizer_known": "optimizer_status" in info_by_coll.get(c.get("id"), {}),
             "running_opt": insights.prom_sum(
@@ -1778,8 +1784,13 @@ async def cluster_page(request: Request):
          or "ok"),
     ]
 
+    for row in coll_rows:
+        tag = f"{row['name']}: "
+        mine = [lvl for lvl, msg in replica_findings if msg.startswith(tag)]
+        row["errors"], row["warnings"] = mine.count("error"), mine.count("warn")
+
     snap_list = snaps if isinstance(snaps, list) else []
-    return _render(request, "cluster.html", {
+    return {
         "conn": conn,
         "errors": errors,
         "health": health,
@@ -1818,7 +1829,14 @@ async def cluster_page(request: Request):
         "latency": insights.latency_table(metrics)[:30],
         "full_snapshots": snap_list,
         "full_snapshots_bytes": sum(s.get("size") or 0 for s in snap_list),
-    })
+    }
+
+
+@app.get("/cluster", response_class=HTMLResponse)
+async def cluster_page(request: Request):
+    if not conn.connected:
+        return RedirectResponse(url="/")
+    return _render(request, "cluster.html", await _cluster_state(request))
 
 
 @app.get("/api/cluster/sample")
@@ -1937,8 +1955,9 @@ async def collection_health(request: Request, name: str):
     coll_tele = next(
         (c for c in _d(tele.get("collections")).get("collections") or [] if c.get("id") == name), {}
     )
-    segments, opt_log, nbyname, vbytes, pbytes = [], [], {}, 0, 0
+    opt_log, nbyname, vbytes, pbytes = [], {}, 0, 0
     segments = _local_segments(tele, name)
+    seg_analysis = insights.segment_analysis(segments, _d(info.get("config")))
     for s in coll_tele.get("shards") or []:
         local = _d(s.get("local"))
         opt_log += _d(local.get("optimizations")).get("log") or []
@@ -1967,8 +1986,7 @@ async def collection_health(request: Request, name: str):
     return _render(request, "partials/health.html", {
         "errors": errors,
         "warnings": sorted(
-            replicas["findings"] + layout["findings"]
-            + insights.segment_analysis(segments, _d(info.get("config")))["findings"] + [
+            replicas["findings"] + layout["findings"] + seg_analysis["findings"] + [
                 w for w in insights.collection_warnings(
                     info, shard_info if isinstance(shard_info, dict) else None, segments, tiers, usage)
                 # replica_matrix reports shard state with every peer's view, so drop the single-peer duplicate.
@@ -1983,6 +2001,9 @@ async def collection_health(request: Request, name: str):
         "raft_leader": raft_leader,
         "replication_factor": rf,
         "collection_name": name,
+        "seg": seg_analysis,
+        "seg_peers": [p for p, b in bases.items() if b],
+        "indexing_threshold": _d(_d(info.get("config")).get("optimizer_config")).get("indexing_threshold"),
         "states_info": insights.REPLICA_STATES,
         "status_meaning": insights.COLLECTION_STATUS,
         "shard_info": _d(shard_info),

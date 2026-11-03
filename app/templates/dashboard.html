@@ -227,94 +227,109 @@ document.getElementById('migrate-form')?.addEventListener('submit', async functi
 </div>
 
 {% else %}
-<!-- ── Collection grid ── -->
-<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
-  {% for col in collections %}
-  <div class="relative">
-    <form action="/api/collections/{{ col.name }}/delete" method="post"
-          onsubmit="return confirm('Delete collection {{ col.name }}? This is irreversible.')"
-          class="absolute top-3 right-3 z-10">
-      <button type="submit"
-              class="text-[#4b5f82] hover:text-[#f87171] text-xs px-2 py-1 rounded hover:bg-[rgba(248,113,113,0.08)]"
-              title="Delete collection">✕</button>
-    </form>
-  <a href="/collection/{{ col.name }}"
-     class="qd-card card-enter p-5 block cursor-pointer"
-     style="animation-delay: {{ loop.index0 * 80 }}ms">
-
-    <!-- Header -->
-    <div class="flex items-start justify-between mb-4 pr-8">
-      <div class="flex-1 min-w-0">
-        <h2 class="font-display font-bold text-base text-white truncate">{{ col.name }}</h2>
-      </div>
-      {% if col.status == 'green' %}
-      <span class="badge badge-green ml-3">
-        <span class="w-1.5 h-1.5 rounded-full bg-[#4ade80]"></span>Ready
-      </span>
-      {% elif col.status == 'yellow' %}
-      <span class="badge badge-yellow ml-3">
-        <span class="w-1.5 h-1.5 rounded-full bg-[#fbbf24]"></span>Indexing
-      </span>
-      {% else %}
-      <span class="badge badge-red ml-3">
-        <span class="w-1.5 h-1.5 rounded-full bg-[#f87171]"></span>{{ col.status }}
-      </span>
-      {% endif %}
-    </div>
-
-    <!-- Stats -->
-    <div class="grid grid-cols-3 gap-4 mb-4">
-      <div>
-        <div class="stat-number">{{ "{:,}".format(col.points_count) }}</div>
-        <div class="stat-label">Points</div>
-      </div>
-      <div>
-        <div class="stat-number">{{ "{:,}".format(col.indexed_vectors_count) }}</div>
-        <div class="stat-label">Indexed</div>
-      </div>
-      <div>
-        <div class="stat-number {% if col.index_pct == 100 %}text-[#4ade80]{% elif col.index_pct < 50 %}text-[#f87171]{% else %}text-[#fbbf24]{% endif %}">{{ col.index_pct }}%</div>
-        <div class="stat-label">Coverage</div>
-      </div>
-    </div>
-
-    <!-- Vector configs -->
-    <div class="space-y-2 pt-3 border-t border-[#1a2236]">
-      {% for vc in col.vec_configs %}
-      <div class="flex items-center gap-2 text-xs">
-        <span class="font-mono text-[#38bdf8]">{{ vc.name or '(default)' }}</span>
-        <span class="text-[#4b5f82]">&middot;</span>
-        <span class="font-mono text-[#7b8fb5]">{{ vc.size }}d</span>
-        <span class="text-[#4b5f82]">&middot;</span>
-        <span class="text-[#7b8fb5]">{{ vc.distance }}</span>
-      </div>
-      {% endfor %}
-      {% for sc in col.sparse_configs %}
-      <div class="flex items-center gap-2 text-xs">
-        <span class="font-mono text-[#f59e0b]">{{ sc.name }}</span>
-        <span class="text-[#4b5f82]">&middot;</span>
-        <span class="text-[#7b8fb5]">sparse</span>
-      </div>
-      {% endfor %}
-    </div>
-
-    <!-- Footer -->
-    <div class="flex items-center justify-between mt-4 pt-3 border-t border-[#1a2236]">
-      <div class="flex items-center gap-1.5 text-xs text-[#4b5f82]">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
-        </svg>
-        {{ col.segments_count }} segment{{ 's' if col.segments_count != 1 else '' }}
-      </div>
-      <div class="text-xs text-[#4b5f82]">
-        opt: <span class="font-mono
-          {% if col.optimizer_status == 'ok' %}text-[#4ade80]{% else %}text-[#fbbf24]{% endif %}
-        ">{{ col.optimizer_status }}</span>
-      </div>
-    </div>
-  </a>
+<!-- ── Cluster health ── -->
+{% if health %}
+<section class="mb-6" aria-label="Cluster health">
+  <div class="flex items-center justify-between mb-2">
+    <h2 class="hud-title mb-0">Cluster <span class="hud-sub">{{ peers | length or 1 }} peer{{ 's' if (peers | length) != 1 }}{% if app_info.version %} · Qdrant {{ app_info.version }}{% endif %}</span></h2>
+    <a href="/cluster" class="text-xs text-[#94a8c8] hover:text-[#00e5a0]">Cluster details →</a>
   </div>
-  {% endfor %}
-</div>
+  <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
+    {% for label, ok, detail in health %}
+    <div class="health-cell {% if not ok %}is-bad{% endif %}">
+      <div class="flex items-center gap-2 text-[0.6875rem] uppercase tracking-wider {% if ok %}text-[#4ade80]{% else %}text-[#f87171]{% endif %}">
+        <span aria-hidden="true">{% if ok %}●{% else %}▲{% endif %}</span>{{ label }}<span class="sr-only">{{ 'ok' if ok else 'problem' }}</span>
+      </div>
+      <div class="font-mono text-xs text-[#d0dce8] mt-1 truncate" title="{{ detail }}">{{ detail }}</div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if errors %}
+<div class="qd-card p-3 mb-6 text-xs text-[#f87171]">▲ Some data could not be read: <span class="font-mono">{{ errors | join(' · ') | trunc(300) }}</span></div>
+{% endif %}
+
+<!-- ── Collections overview ── -->
+<section class="qd-card p-5">
+  <h2 class="hud-title">Collections <span class="hud-sub">one row per collection · click a name for its overview, replicas and segments</span></h2>
+  <div class="overflow-x-auto">
+    <table class="qd-table w-full text-xs">
+      <thead><tr>
+        <th class="text-left px-3 py-2">Collection</th>
+        <th class="text-left px-3 py-2">Health</th>
+        <th class="text-right px-3 py-2">Points</th>
+        <th class="text-left px-3 py-2">Vectors</th>
+        <th class="text-left px-3 py-2">Replicas</th>
+        <th class="text-left px-3 py-2 w-32">HNSW-indexed</th>
+        <th class="text-right px-3 py-2">Memory</th>
+        <th class="text-left px-3 py-2">Findings</th>
+        <th class="px-2 py-2"><span class="sr-only">Delete</span></th>
+      </tr></thead>
+      <tbody>
+      {% for c in collections %}
+      {% set mx = c.replicas or {} %}
+      <tr>
+        <td class="px-3 py-2"><a href="/collection/{{ c.name }}" class="font-mono text-[#38bdf8] hover:text-[#00e5a0]">{{ c.name }}</a>
+          {% if c.info_error %}<div class="text-[0.6875rem] text-[#f87171]" title="{{ c.info_error }}">▲ info unavailable</div>{% endif %}</td>
+        <td class="px-3 py-2 whitespace-nowrap">
+          {% set cs = c.coll_status %}
+          <span class="badge {{ {'green': 'badge-green', 'yellow': 'badge-yellow', 'grey': 'badge-blue', 'red': 'badge-red'}.get(cs, '') }}"
+                title="{{ status_meaning.get(cs, '') }}">{{ '●' if cs == 'green' else '▲' }} {{ cs or 'unknown' }}</span>
+          <div class="text-[0.6875rem] mt-1 {{ 'text-[#f87171]' if c.optimizer_error else 'text-[#94a8c8]' }}" {% if c.optimizer_error %}title="{{ c.optimizer_error }}"{% endif %}>
+            optimizer {% if c.optimizer_error %}▲ error{% elif c.optimizer_known %}ok{% else %}—{% endif %}{% if c.running_opt %} · <span class="text-[#fbbf24]">{{ c.running_opt | int }} running</span>{% endif %}
+          </div>
+        </td>
+        <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(c.cluster_points) }}
+          {% if c.vectors_total and c.vectors_total > c.cluster_points %}<div class="text-[0.6875rem] text-[#94a8c8]" title="vectors include deleted ones until the optimizer vacuums them">{{ '{:,}'.format(c.vectors_total) }} vectors</div>{% endif %}</td>
+        <td class="px-3 py-2 font-mono whitespace-nowrap">
+          {% for v in c.vec_names %}<div><span class="text-[#38bdf8]">{{ v.name }}</span> <span class="text-[#94a8c8]">{{ v.size }}d · {{ v.distance }}</span></div>{% endfor %}
+          {% for n in c.sparse_names %}<div><span class="text-[#f59e0b]">{{ n }}</span> <span class="text-[#94a8c8]">sparse</span></div>{% endfor %}
+        </td>
+        <td class="px-3 py-2 whitespace-nowrap">
+          {% if mx.shards %}
+          {% set readable = mx.shards | sum(attribute='readable') %}
+          {% set total = mx.shards | sum(attribute='total') %}
+          <span class="badge {{ 'badge-green' if readable == total else ('badge-red' if readable == 0 else 'badge-yellow') }}">{{ '●' if readable == total else '▲' }} {{ readable }}/{{ total }} readable</span>
+          {% else %}<span class="text-[#94a8c8]">—</span>{% endif %}
+          <div class="text-[0.6875rem] text-[#94a8c8] mt-1 font-mono">{{ c.shards }} shard{{ 's' if c.shards != 1 }} × RF {{ c.replication }}{% if c.transfers %} · <span class="text-[#fbbf24]">{{ c.transfers }} transfer</span>{% endif %}</div>
+        </td>
+        <td class="px-3 py-2">
+          {% set ipct = (c.indexed_vectors / c.vectors_total * 100) if c.indexed_vectors is number and c.vectors_total else none %}
+          {% if ipct is not none %}
+          <div class="flex items-center gap-2">
+            <div class="meter flex-1 {% if ipct < 50 %}meter-bad{% elif ipct < 99 %}meter-warn{% endif %}"><span style="width: {{ [ipct, 100] | min }}%"></span></div>
+            <span class="font-mono w-10 text-right">{{ [ipct, 100] | min | round(0) | int }}%</span>
+          </div>
+          {% else %}<span class="text-[#94a8c8]">—</span>{% endif %}
+          <div class="text-[0.6875rem] text-[#94a8c8] mt-1">{{ c.segments_count if c.segments_count is number else '—' }} segment{{ 's' if c.segments_count != 1 }}</div>
+        </td>
+        <td class="px-3 py-2 text-right font-mono whitespace-nowrap">
+          {% if c.usage %}
+          <div>{{ c.usage.disk_bytes | bytes }} <span class="text-[#94a8c8]">disk</span></div>
+          <div>{{ c.usage.ram_bytes | bytes }} <span class="text-[#94a8c8]">heap</span></div>
+          <div class="{% if c.usage.warm_pct is number and c.usage.warm_pct < 80 %}text-[#fbbf24]{% endif %}">{{ '%.0f%%' | format(c.usage.warm_pct) if c.usage.warm_pct is number else '—' }} <span class="text-[#94a8c8]">warm</span></div>
+          {% else %}{{ (c.vectors_bytes + c.payload_bytes) | bytes }} <span class="text-[#94a8c8]">on disk</span>{% endif %}
+        </td>
+        <td class="px-3 py-2 whitespace-nowrap">
+          {% if c.errors %}<a href="/collection/{{ c.name }}" class="badge badge-red">▲ {{ c.errors }} error{{ 's' if c.errors != 1 }}</a>{% endif %}
+          {% if c.warnings %}<a href="/collection/{{ c.name }}" class="badge badge-yellow">▲ {{ c.warnings }} warning{{ 's' if c.warnings != 1 }}</a>{% endif %}
+          {% if not c.errors and not c.warnings %}<span class="text-[#4ade80]">● none</span>{% endif %}
+        </td>
+        <td class="px-2 py-2">
+          <form action="/api/collections/{{ c.name }}/delete" method="post"
+                onsubmit="return confirm('Delete collection {{ c.name }}? This is irreversible.')">
+            <button type="submit" class="text-[#94a8c8] hover:text-[#f87171] text-xs px-2 py-1 rounded hover:bg-[rgba(248,113,113,0.08)]"
+                    title="Delete collection {{ c.name }}" aria-label="Delete collection {{ c.name }}">✕</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="text-[0.6875rem] text-[#94a8c8] mt-2">Points = largest replica per shard, summed. Findings count replica, placement, status and optimizer issues; open the collection for details.</p>
+</section>
 {% endif %}
 {% endblock %}

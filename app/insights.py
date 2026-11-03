@@ -553,7 +553,7 @@ def segment_analysis(segments: list, config: dict) -> dict:
             "vector_configs": vectors, "payload_indexes": pidx,
             "drift": [d for v in vectors for d in v["drift"]],
         }
-        plain_kib = (info.get("vectors_size_bytes") or 0) / 1024 if n_vec > n_idx else 0
+        plain_kib = (info.get("vectors_size_bytes") or 0) / 1024 * (n_vec - n_idx) / n_vec if n_vec > n_idx else 0
         row["plain_kib"] = plain_kib
         row["over_threshold"] = bool(isinstance(threshold_kib, (int, float)) and threshold_kib and plain_kib >= threshold_kib)
         rows.append(row)
@@ -873,4 +873,6 @@ if __name__ == "__main__":
     ps = peer_summary(mx6)
     assert ps["p1"]["replicas"] == 4 and ps["p1"]["worst_state"] == "Dead" and ps["p1"]["unreadable"] == 1
     assert ps["p3"]["active"] == 3 and ps["p3"]["points"] == 30000 and ps["p3"]["worst_state"] is None
+    part_idx = segment_analysis([seg("pi", "indexed", 30000, 29000)], seg_cfg)
+    assert not part_idx["rows"][0]["over_threshold"] and round(part_idx["rows"][0]["plain_kib"]) == 1000
     print("ok")
