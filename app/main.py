@@ -1775,7 +1775,7 @@ async def cluster_page(request: Request):
 @app.get("/api/cluster/sample")
 async def cluster_sample():
     if not conn.connected:
-        return JSONResponse({"error": "Not connected"}, status_code=400)
+        return JSONResponse({"error": f"Not connected to Qdrant at {conn.host}:{conn.port}"}, status_code=503)
     async with httpx.AsyncClient(timeout=10) as client:
         txt, err = await _qget(client, "/metrics", raw=True)
     if err:
