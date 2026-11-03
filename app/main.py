@@ -1528,7 +1528,7 @@ async def api_peers_save(urls: str = Form("")):
     if not conn.connected:
         return RedirectResponse(url="/", status_code=303)
     candidates = [_normalize_url(u) for u in urls.replace(",", "\n").splitlines() if u.strip()]
-    async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=0.5)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
         clus, cerr = await _qget(client, "/cluster")
         known = {str(p) for p in _d(_d(clus).get("peers"))}
         resolved = await asyncio.gather(*(_resolve_peer(client, u) for u in candidates))
@@ -1543,10 +1543,9 @@ async def api_peers_save(urls: str = Form("")):
             skipped.append(url)
             if pid is None:
                 blips.add(url)
-    taken = set(mapped.values())
     # Keep a mapping whose URL was submitted but did not answer (port-forward blip); drop everything else
     # that was not re-confirmed, including peers that left the cluster.
-    kept = {k: v for k, v in conn.peer_urls.items() if k in known and k not in mapped and v in blips and v not in taken}
+    kept = {k: v for k, v in conn.peer_urls.items() if k in known and k not in mapped and v in blips}
     conn.peer_urls = {**kept, **mapped}
     _save_conn_state(conn.host, conn.port, conn.peer_urls)
     msg = f"Mapped {len(mapped)} peer(s)." + (f" Not part of this cluster or unreachable: {', '.join(skipped)}" if skipped else "")
@@ -1634,7 +1633,7 @@ async def cluster_page(request: Request):
     for cid, (views, rstats, rerr) in zip(coll_ids, replica_results):
         mx = insights.replica_matrix(views, rstats, _cluster_shards(cltele, cid))
         replicas_by_coll[cid] = mx
-        pl = insights.placement(mx, [p for p in views], rf_by_coll.get(cid, 1))
+        pl = insights.placement(mx, list(views), rf_by_coll.get(cid, 1))
         replica_findings += [(lvl, f"{cid}: {msg}") for lvl, msg in mx["findings"] + pl["findings"] if lvl != "info"]
     replica_findings.sort(key=lambda f: {"error": 0, "warn": 1}.get(f[0], 2))
     # Peers whose replicas no source (direct endpoint or /cluster/telemetry) reported.
@@ -1702,7 +1701,8 @@ async def cluster_page(request: Request):
         if not live_raft and dd.get("term") is not None:
             # /cluster/telemetry carries each peer's own raft view but not whom it sees as leader.
             live_raft = {"role": dd.get("role"), "term": dd.get("term"), "commit": dd.get("commit"),
-                         "pending_operations": dd.get("num_pending_operations"), "leader": None}
+                         "pending_operations": dd.get("num_pending_operations"), "leader": None,
+                         "from_telemetry": True}
         live_metrics = insights.parse_prom(live["metrics"]) if live else {}
         peers.append({
             "id": pid,
@@ -1729,7 +1729,7 @@ async def cluster_page(request: Request):
     raft = _d(clus.get("raft_info"))
     versions = {p["version"] for p in peers if p["version"]}
     live_rafts = [p["live_raft"] for p in peers if p["live_raft"]]
-    leaders = {r.get("leader") for r in live_rafts if r.get("leader") is not None}
+    leaders = {r.get("leader") for r in live_rafts if not r.get("from_telemetry")}
     terms = {r.get("term") for r in live_rafts if r.get("term") is not None}
     quota_exceeded = {k: v for k, v in _d(_d(tele.get("quota")).get("exceeded")).items() if v}
     leader_id = str(raft.get("leader", "")) if raft.get("leader") is not None else ""
@@ -1816,6 +1816,42 @@ async def cluster_sample():
     return {"ts": time.time(), **insights.sample(insights.parse_prom(resp.text))}
 
 
+def _local_segments(telemetry: dict, collection: str) -> list:
+    for c in _d(_d(telemetry).get("collections")).get("collections") or []:
+        if c.get("id") == collection:
+            return [{**seg, "_shard": sh.get("id")} for sh in c.get("shards") or []
+                    for seg in _d(sh.get("local")).get("segments") or []]
+    return []
+
+
+@app.get("/api/{name}/segments", response_class=HTMLResponse)
+async def collection_segments(request: Request, name: str, peer: str = Query("")):
+    if not conn.connected:
+        return HTMLResponse("<p class='text-red-400 p-4 text-xs'>Not connected</p>")
+    q = quote(name, safe="")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=2.0)) as client:
+        clus, bases = await _peer_bases(client)
+        self_id = str(clus.get("peer_id") or "")
+        base = bases.get(peer) if peer else _qdrant_base_url()
+        if peer and not base:
+            return HTMLResponse(f"<p class='text-[#fbbf24] p-4 text-xs'>▲ Peer {peer} has no mapped endpoint.</p>")
+        # ponytail: level 6 telemetry covers every collection on that peer; fine for a handful of collections.
+        (info, e1), (tele, e2) = await asyncio.gather(
+            _qget(client, f"/collections/{q}"),
+            _qget(client, "/telemetry?details_level=6", base=base),
+        )
+    analysis = insights.segment_analysis(_local_segments(_d(tele), name), _d(_d(info).get("config")))
+    return _render(request, "partials/segments.html", {
+        "seg": analysis,
+        "errors": [e for e in (e1, e2) if e],
+        "peer": peer or self_id,
+        "peers": [p for p, b in bases.items() if b],
+        "self_id": self_id,
+        "collection_name": name,
+        "indexing_threshold": _d(_d(_d(info).get("config")).get("optimizer_config")).get("indexing_threshold"),
+    })
+
+
 @app.get("/api/{name}/health", response_class=HTMLResponse)
 async def collection_health(request: Request, name: str):
     if not conn.connected:
@@ -1839,12 +1875,15 @@ async def collection_health(request: Request, name: str):
         others = {pid: b for pid, b in bases.items() if b and pid != self_id}
         other_tele = await asyncio.gather(*(_qget(client, "/telemetry?details_level=3", base=b) for b in others.values()))
         tele_by_peer = {self_id: _d(tele), **{pid: _d(t) for pid, (t, _) in zip(others, other_tele)}}
-        views, remote_stats, view_errors = await _replica_views(client, bases, name, tele_by_peer)
-        cltele = None
-        if any(v is None for v in views.values()):
-            cltele, cterr = await _qget(client, "/cluster/telemetry?details_level=3")
-            if cterr:
-                view_errors.append(cterr)
+        async def no_telemetry():
+            return None, None
+        need_ct = any(b is None for b in bases.values())
+        (views, remote_stats, view_errors), (cltele, cterr) = await asyncio.gather(
+            _replica_views(client, bases, name, tele_by_peer),
+            _qget(client, "/cluster/telemetry?details_level=3") if need_ct else no_telemetry(),
+        )
+        if cterr:
+            view_errors.append(cterr)
         if "local" in bases and "local" not in views and len(views) == 1:
             self_id = next(iter(views))
             bases = {self_id: bases["local"]}
@@ -1879,7 +1918,7 @@ async def collection_health(request: Request, name: str):
     segments, opt_log, nbyname, vbytes, pbytes = [], [], {}, 0, 0
     for s in coll_tele.get("shards") or []:
         local = _d(s.get("local"))
-        segments += local.get("segments") or []
+        segments += [{**seg, "_shard": s.get("id")} for seg in local.get("segments") or []]
         opt_log += _d(local.get("optimizations")).get("log") or []
         vbytes += local.get("vectors_size_bytes") or 0
         pbytes += local.get("payloads_size_bytes") or 0
@@ -1906,7 +1945,8 @@ async def collection_health(request: Request, name: str):
     return _render(request, "partials/health.html", {
         "errors": errors,
         "warnings": sorted(
-            replicas["findings"] + layout["findings"] + [
+            replicas["findings"] + layout["findings"]
+            + insights.segment_analysis(segments, _d(info.get("config")))["findings"] + [
                 w for w in insights.collection_warnings(
                     info, shard_info if isinstance(shard_info, dict) else None, segments, tiers, usage)
                 # replica_matrix reports shard state with every peer's view, so drop the single-peer duplicate.
@@ -1920,6 +1960,7 @@ async def collection_health(request: Request, name: str):
         "self_id": self_id,
         "raft_leader": raft_leader,
         "replication_factor": rf,
+        "collection_name": name,
         "states_info": insights.REPLICA_STATES,
         "shard_info": _d(shard_info),
         "optimizations": _d(opts),

@@ -321,7 +321,6 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
             if r["state"] is None:
                 r["state"], r["points"] = rp.get("state"), rp.get("num_points")
                 r["source"] = "cluster telemetry"
-                r["seen"].setdefault(r["peer"], rp.get("state"))
 
     for viewer, remotes in remote_stats.items():
         for rm in remotes or []:
@@ -343,7 +342,7 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
         top = max(counted) if counted else None
         readable = 0
         for r in replicas:
-            states = set(r["seen"].values())
+            states = set(r["seen"].values()) or ({r["state"]} if r["state"] else set())
             r["consensus_state"] = r["state"] or (next(iter(states)) if len(states) == 1 else None)
             r["disagree"] = len(states) > 1
             r["readable"] = all(REPLICA_STATES.get(s, {}).get("readable") for s in states) if states else None
@@ -368,8 +367,10 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
             findings.append(("error", f"Shard {shard_id} has no readable replica: reads of this shard fail."))
         out.append({"shard_id": shard_id, "replicas": replicas, "readable": readable, "total": len(replicas),
                     "max_points": top})
-    covered = {r["peer"] for sh in out for r in sh["replicas"] if r["state"] is not None}
-    unreachable = sorted(str(p) for p, v in views.items() if v is None and str(p) not in covered)
+    unverified = {r["peer"] for sh in out for r in sh["replicas"] if r["state"] is None}
+    if cluster_shards is None:
+        unverified |= {str(p) for p, v in views.items() if v is None}
+    unreachable = sorted(unverified)
     if unreachable:
         findings.append(("info", f"No data for peer(s) {', '.join(unreachable)}: their replica state and point counts are not verified."))
     findings.sort(key=lambda f: {"error": 0, "warn": 1}.get(f[0], 2))
@@ -417,6 +418,95 @@ def placement(matrix: dict, peers: list[str], replication_factor: int) -> dict:
             findings.append(("warn", f"Peer {p} holds the only readable replica of {v['sole_readable']} shard(s): "
                                      "if it goes down those shards cannot be read."))
     return {"peers": peers, "grid": grid, "per_peer": per_peer, "findings": findings, "keyed": keyed}
+
+
+def _hnsw_expected(config: dict, vector_name: str) -> dict:
+    base = dict(config.get("hnsw_config") or {})
+    vectors = (config.get("params") or {}).get("vectors") or {}
+    vcfg = vectors if "size" in vectors else vectors.get(vector_name) or {}
+    base.update({k: v for k, v in (vcfg.get("hnsw_config") or {}).items() if v is not None})
+    return base
+
+
+def _quant_expected(config: dict, vector_name: str) -> str | None:
+    vectors = (config.get("params") or {}).get("vectors") or {}
+    vcfg = vectors if "size" in vectors else vectors.get(vector_name) or {}
+    q = _quantization_kind(vcfg.get("quantization_config") or config.get("quantization_config"))
+    return q[0] if q else None
+
+
+def segment_analysis(segments: list, config: dict) -> dict:
+    """segments: telemetry shards[].local.segments[] entries, each optionally tagged with "_shard"."""
+    opt = config.get("optimizer_config") or {}
+    threshold = opt.get("indexing_threshold")
+    rows, drift, findings = [], [], []
+    total_points = unindexed = deferred = 0
+
+    for seg in segments:
+        info, cfg = seg.get("info") or {}, seg.get("config") or {}
+        vectors = []
+        for vname, vd in (cfg.get("vector_data") or {}).items():
+            idx = vd.get("index") or {}
+            opts = idx.get("options") or {}
+            q = _quantization_kind(vd.get("quantization_config"))
+            counts = (info.get("vector_data") or {}).get(vname) or {}
+            v = {"name": vname or "(default)", "storage": vd.get("storage_type"), "index": idx.get("type"),
+                 "m": opts.get("m"), "ef_construct": opts.get("ef_construct"), "payload_m": opts.get("payload_m"),
+                 "hnsw_on_disk": opts.get("on_disk"), "quantization": q[0] if q else None,
+                 "num_vectors": counts.get("num_vectors"), "num_indexed": counts.get("num_indexed_vectors"),
+                 "drift": []}
+            if v["index"] == "hnsw":
+                want = _hnsw_expected(config, vname)
+                for k in ("m", "ef_construct", "payload_m", "on_disk"):
+                    have = opts.get(k)
+                    if want.get(k) is not None and have is not None and have != want[k]:
+                        v["drift"].append(f"{k} {have} (config {want[k]})")
+                wq = _quant_expected(config, vname)
+                if wq != v["quantization"]:
+                    v["drift"].append(f"quantization {v['quantization'] or 'none'} (config {wq or 'none'})")
+            vectors.append(v)
+
+        pidx = {}
+        for pf in seg.get("payload_field_indices") or []:
+            if "null_index" in (pf.get("index_type") or ""):
+                continue
+            pidx[pf.get("field_name")] = {"type": pf.get("index_type"), "points": pf.get("points_count")}
+
+        n_vec = info.get("num_vectors") or 0
+        n_idx = info.get("num_indexed_vectors") or 0
+        n_del = info.get("num_deleted_vectors") or 0
+        n_pts = info.get("num_points") or 0
+        total_points += n_pts
+        unindexed += max(n_vec - n_idx, 0)
+        deferred += info.get("num_deferred_points") or 0
+        row = {
+            "uuid": info.get("uuid") or "", "shard": seg.get("_shard"), "type": info.get("segment_type"),
+            "appendable": bool(info.get("is_appendable")), "points": n_pts, "vectors": n_vec, "indexed": n_idx,
+            "indexed_pct": n_idx / n_vec * 100 if n_vec else None, "deleted": n_del,
+            "deleted_pct": n_del / n_vec * 100 if n_vec else None,
+            "deferred": info.get("num_deferred_points") or 0,
+            "vectors_bytes": info.get("vectors_size_bytes"), "payload_bytes": info.get("payloads_size_bytes"),
+            "payload_storage": (cfg.get("payload_storage_type") or {}).get("type"),
+            "vector_configs": vectors, "payload_indexes": pidx,
+            "drift": [d for v in vectors for d in v["drift"]],
+        }
+        rows.append(row)
+        if row["drift"]:
+            drift.append(row)
+
+    if unindexed:
+        share = unindexed / total_points * 100 if total_points else 0
+        where = f" (below indexing_threshold={threshold:,})" if isinstance(threshold, int) and unindexed < threshold else ""
+        lvl = "warn" if isinstance(threshold, int) and unindexed >= threshold * 2 else "info"
+        findings.append((lvl, f"{unindexed:,} vectors ({share:.1f}%) are not HNSW-indexed yet{where}; searches scan them brute-force."))
+    if drift:
+        sample = drift[0]["drift"][0]
+        findings.append(("warn", f"{len(drift)} segment(s) were built with settings that differ from the collection config "
+                                 f"(e.g. {sample}); they change on the next optimization of those segments."))
+    if deferred:
+        findings.append(("info", f"{deferred:,} point(s) are waiting for deferred indexing."))
+    rows.sort(key=lambda r: (r["shard"] if r["shard"] is not None else -1, not r["appendable"], -(r["points"] or 0)))
+    return {"rows": rows, "findings": findings, "unindexed": unindexed, "total_points": total_points}
 
 
 def _segment_infos(segments: list) -> list[dict]:
@@ -578,7 +668,6 @@ if __name__ == "__main__":
     assert any("`brand`" in x and "2.0 MiB" in x for x in w2) and any("60% of the expected" in x for x in w2)
     fm = filter_metrics(parse_prom('a{collection="x"} 1\na{collection="y"} 2\n'), collection="x")
     assert fm["a"] == [({"collection": "x"}, 1.0)]
-    # Fixture: real 3-peer cluster where peer A reports itself Active with 0 points, B/C see it as ManualRecovery.
     A, B, C = "1238546195235563", "7280789038393895", "6268658232539136"
     views = {
         A: {"peer_id": int(A), "local_shards": [{"shard_id": 0, "points_count": 0, "state": "Active"}],
@@ -603,7 +692,7 @@ if __name__ == "__main__":
     assert any("0 points while another replica holds 991,806" in m for m in msgs)
     assert any("failed 10 update" in m for m in msgs)
     partial = replica_matrix({A: views[A], B: None})
-    assert partial["unreachable"] == [B] and partial["shards"][0]["replicas"][1]["points"] is None
+    assert partial["unreachable"] == sorted([B, C]) and partial["shards"][0]["replicas"][1]["points"] is None
     assert collection_warnings({"status": None, "points_count": None, "config": {}}, {"local_shards": None}, [], []) is not None
     assert replica_matrix({"x": {"peer_id": None, "local_shards": [{"shard_id": 0, "points_count": None, "state": "Active"}]}})["shards"][0]["replicas"][0]["peer"] == "x"
     lat404 = latency_table(parse_prom('rest_responses_total{method="GET",endpoint="/x",status="404"} 2\n'))
@@ -625,7 +714,6 @@ if __name__ == "__main__":
     vr = {r["peer"]: r for r in via_ct["shards"][0]["replicas"]}
     assert vr[B]["points"] == 991806 and vr[B]["source"] == "cluster telemetry" and vr[A]["source"] == "peer"
     assert via_ct["unreachable"] == [] and vr[A]["delta"] == -991806
-    # 6 shards × RF 2 over 3 peers: shard 5 under-replicated and skewed, shard 2 has one Dead copy.
     P = ["p1", "p2", "p3"]
     def rep_(sid, peer, pts, st="Active"):
         return {"shard_id": sid, "points_count": pts, "state": st}
@@ -655,4 +743,36 @@ if __name__ == "__main__":
     assert any("Dead" in m for _, m in mx6["findings"]) and mx6["shards"][2]["readable"] == 1
     single = placement(replica_matrix({"x": {"peer_id": "x", "local_shards": [{"shard_id": 0, "points_count": 5, "state": "Active"}]}}), ["x"], 1)
     assert single["findings"] == [], single["findings"]
+    gone = replica_matrix({"a": {"peer_id": "a", "local_shards": [{"shard_id": 0, "points_count": 1, "state": "Active"}]}, "c": None},
+                          None, [{"id": 0, "replicas": [{"peer_id": "a", "state": "Active", "num_points": 1}]}])
+    assert gone["unreachable"] == [], gone["unreachable"]
+    part = replica_matrix({"a": {"peer_id": "a", "local_shards": [], "remote_shards": [
+        {"shard_id": 0, "peer_id": "b", "state": "Active"}, {"shard_id": 1, "peer_id": "b", "state": "Active"}]}, "b": None},
+        None, [{"id": 0, "replicas": [{"peer_id": "b", "state": "Active", "num_points": 1}]}])
+    assert part["unreachable"] == ["b"], part["unreachable"]
+    relayed = replica_matrix({"a": {"peer_id": "a", "local_shards": [], "remote_shards": [{"shard_id": 0, "peer_id": "b", "state": "Partial"}]}, "b": None},
+                             None, [{"id": 0, "replicas": [{"peer_id": "b", "state": "Active", "num_points": 1}]}])
+    assert not relayed["shards"][0]["replicas"][0]["disagree"]
+    seg_cfg = {"params": {"vectors": {"v": {"size": 4, "on_disk": True}}},
+               "hnsw_config": {"m": 0, "ef_construct": 128, "payload_m": 16, "on_disk": False},
+               "optimizer_config": {"indexing_threshold": 20000},
+               "quantization_config": {"scalar": {"type": "int8"}}}
+    def seg(uuid, typ, pts, idx, deleted=0, m=0, quant=True):
+        index = {"type": "plain", "options": {}} if typ == "plain" else {
+            "type": "hnsw", "options": {"m": m, "ef_construct": 128, "payload_m": 16, "on_disk": False}}
+        return {"_shard": 0, "info": {"uuid": uuid, "segment_type": typ, "num_points": pts, "num_vectors": pts + deleted,
+                                       "num_indexed_vectors": idx, "num_deleted_vectors": deleted, "is_appendable": typ == "plain"},
+                "config": {"vector_data": {"v": {"storage_type": "Mmap", "index": index,
+                                                 "quantization_config": {"scalar": {"type": "int8"}} if quant and typ != "plain" else None}},
+                           "payload_storage_type": {"type": "in_ram_mmap"}},
+                "payload_field_indices": [{"field_name": "cat", "index_type": "immutable_map", "points_count": 5},
+                                          {"field_name": "cat", "index_type": "mutable_null_index", "points_count": 9}]}
+    sa = segment_analysis([seg("p1", "plain", 8313, 0), seg("i1", "indexed", 785418, 835630, deleted=50212),
+                           seg("i2", "indexed", 198075, 198075, m=16, quant=False)], seg_cfg)
+    sm = [m_ for _, m_ in sa["findings"]]
+    assert sa["unindexed"] == 8313 and any("8,313 vectors" in x and "indexing_threshold=20,000" in x for x in sm), sm
+    assert any("1 segment(s) were built" in x and "m 16 (config 0)" in x for x in sm), sm
+    assert sa["rows"][0]["uuid"] == "p1" and sa["rows"][0]["drift"] == []
+    i2 = next(r for r in sa["rows"] if r["uuid"] == "i2")
+    assert "quantization none (config scalar)" in i2["drift"] and list(i2["payload_indexes"]) == ["cat"]
     print("ok")

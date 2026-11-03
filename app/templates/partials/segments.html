@@ -1,0 +1,146 @@
+{% if errors %}
+<ul class="text-xs font-mono text-[#f87171] mb-3">{% for e in errors %}<li>▲ {{ e }}</li>{% endfor %}</ul>
+{% endif %}
+
+{% if peers | length > 1 %}
+<div class="flex flex-wrap items-center gap-2 mb-4 text-xs" role="tablist" aria-label="Peer">
+  <span class="text-[#7b8fb5]">Peer</span>
+  {% for p in peers %}
+  <button type="button" role="tab" aria-selected="{{ 'true' if p == peer else 'false' }}"
+          class="px-3 py-1 rounded font-mono border {{ 'border-[#00e5a0] text-[#00e5a0] bg-[rgba(0,229,160,0.08)]' if p == peer else 'border-[#243049] text-[#94a8c8] hover:text-white' }}"
+          hx-get="/api/{{ collection_name }}/segments?peer={{ p }}" hx-target="#segments-content" hx-swap="innerHTML"
+          title="{{ p }}">…{{ p[-6:] }}{% if p == self_id %} · this{% endif %}</button>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% set rows = seg.rows %}
+{% if not rows %}
+<p class="text-xs text-[#94a8c8]">This peer holds no segments of this collection.</p>
+{% else %}
+{% set immutable = rows | rejectattr('appendable') | list %}
+<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 text-xs">
+  <div class="health-cell"><div class="text-[0.6875rem] uppercase tracking-wider text-[#7b8fb5]">Segments</div>
+    <div class="font-mono text-[#d0dce8] mt-1">{{ rows | length }} · {{ immutable | length }} immutable · {{ rows | length - immutable | length }} appendable</div></div>
+  <div class="health-cell"><div class="text-[0.6875rem] uppercase tracking-wider text-[#7b8fb5]">Points</div>
+    <div class="font-mono text-[#d0dce8] mt-1">{{ '{:,}'.format(seg.total_points) }}</div></div>
+  <div class="health-cell {% if seg.unindexed %}{% endif %}"><div class="text-[0.6875rem] uppercase tracking-wider text-[#7b8fb5]">Not HNSW-indexed</div>
+    <div class="font-mono mt-1 {{ 'text-[#fbbf24]' if seg.unindexed else 'text-[#4ade80]' }}">{{ '▲ ' if seg.unindexed else '● ' }}{{ '{:,}'.format(seg.unindexed) }} vectors</div></div>
+  <div class="health-cell"><div class="text-[0.6875rem] uppercase tracking-wider text-[#7b8fb5]">Config drift</div>
+    {% set drifted = rows | selectattr('drift') | list | length %}
+    <div class="font-mono mt-1 {{ 'text-[#fbbf24]' if drifted else 'text-[#4ade80]' }}">{{ '▲ ' if drifted else '● ' }}{{ drifted }} segment{{ 's' if drifted != 1 }}</div></div>
+</div>
+
+<div class="overflow-x-auto">
+  <table class="qd-table w-full text-xs">
+    <thead><tr>
+      <th class="px-2 py-2 w-6"><span class="sr-only">Details</span></th>
+      <th class="text-left px-3 py-2">Segment</th>
+      <th class="text-left px-3 py-2">State</th>
+      <th class="text-right px-3 py-2">Points</th>
+      <th class="text-left px-3 py-2 w-36">HNSW-indexed</th>
+      <th class="text-right px-3 py-2">Deleted</th>
+      <th class="text-left px-3 py-2">Vector storage · index</th>
+      <th class="text-left px-3 py-2">Quantization</th>
+      <th class="text-right px-3 py-2">Vectors</th>
+      <th class="text-right px-3 py-2">Payload</th>
+    </tr></thead>
+    <tbody>
+    {% for r in rows %}
+    {% set v = r.vector_configs[0] if r.vector_configs else {} %}
+    <tr>
+      <td class="px-2 py-2 align-top">
+        <button type="button" onclick="toggleDetail(this)" aria-label="Show segment {{ r.uuid[:8] }} details"
+                class="w-6 h-6 rounded border border-[#243049] text-[#94a8c8] hover:text-white leading-none">+</button>
+      </td>
+      <td class="px-3 py-2 align-top whitespace-nowrap">
+        <span class="font-mono text-[#38bdf8]" title="{{ r.uuid }}">{{ r.uuid[:8] }}</span>
+        {% if r.shard is not none %}<div class="text-[0.6875rem] text-[#7b8fb5]">shard {{ r.shard }}</div>{% endif %}
+      </td>
+      <td class="px-3 py-2 align-top">
+        <div class="flex flex-wrap gap-1">
+          <span class="badge {{ 'badge-green' if r.type == 'indexed' else 'badge-yellow' }}">{{ r.type }}</span>
+          <span class="badge {{ 'badge-blue' if r.appendable else '' }} {{ '' if r.appendable else 'text-[#94a8c8] border border-[#243049]' }}"
+                title="{{ 'Receives new writes' if r.appendable else 'Read-only; rebuilt only by the optimizer' }}">{{ 'appendable' if r.appendable else 'immutable' }}</span>
+          {% if r.drift %}<span class="badge badge-yellow" title="{{ r.drift | join(', ') }}">▲ drift</span>{% endif %}
+        </div>
+      </td>
+      <td class="px-3 py-2 align-top text-right font-mono">{{ '{:,}'.format(r.points) }}</td>
+      <td class="px-3 py-2 align-top">
+        {% if r.indexed_pct is number %}
+        <div class="flex items-center gap-2">
+          <div class="meter flex-1 {% if r.indexed_pct < 50 %}meter-bad{% elif r.indexed_pct < 100 %}meter-warn{% endif %}"><span style="width: {{ r.indexed_pct }}%"></span></div>
+          <span class="font-mono w-11 text-right">{{ r.indexed_pct | round(0) | int }}%</span>
+        </div>
+        {% else %}<span class="text-[#7b8fb5]">—</span>{% endif %}
+      </td>
+      <td class="px-3 py-2 align-top text-right font-mono whitespace-nowrap {% if (r.deleted_pct or 0) > 10 %}text-[#fbbf24]{% endif %}">
+        {{ '{:,}'.format(r.deleted) }}{% if r.deleted_pct %} <span class="text-[#7b8fb5]">· {{ r.deleted_pct | round(1) }}%</span>{% endif %}
+        {% if r.deferred %}<div class="text-[0.6875rem] text-[#7dd3fc]">{{ '{:,}'.format(r.deferred) }} deferred</div>{% endif %}
+      </td>
+      <td class="px-3 py-2 align-top font-mono whitespace-nowrap">
+        {% for vc in r.vector_configs %}
+        <div>
+          <span class="text-[#d0dce8]">{{ vc.storage }}</span> ·
+          {% if vc.index == 'hnsw' %}hnsw <span class="text-[#94a8c8]">m{{ vc.m }} ef{{ vc.ef_construct }}{% if vc.payload_m %} pm{{ vc.payload_m }}{% endif %}{% if vc.hnsw_on_disk %} disk{% endif %}</span>
+          {% else %}<span class="text-[#fbbf24]">{{ vc.index or '—' }}</span>{% endif %}
+          {% if r.vector_configs | length > 1 %}<span class="text-[#7b8fb5]"> ({{ vc.name }})</span>{% endif %}
+        </div>
+        {% endfor %}
+      </td>
+      <td class="px-3 py-2 align-top font-mono">{% for vc in r.vector_configs %}<div>{{ vc.quantization or '—' }}</div>{% endfor %}</td>
+      <td class="px-3 py-2 align-top text-right font-mono">{{ r.vectors_bytes | bytes }}</td>
+      <td class="px-3 py-2 align-top text-right font-mono">{{ r.payload_bytes | bytes }}<div class="text-[0.6875rem] text-[#7b8fb5]">{{ r.payload_storage or '' }}</div></td>
+    </tr>
+    <tr class="detail-row hidden">
+      <td></td>
+      <td colspan="9" class="px-3 py-3">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+          <div>
+            <div class="text-[0.6875rem] uppercase tracking-wider text-[#7b8fb5] mb-2">Segment</div>
+            <dl class="kv">
+              <dt>UUID</dt><dd>{{ r.uuid }}</dd>
+              <dt>Vectors (incl. deleted)</dt><dd>{{ '{:,}'.format(r.vectors) }}</dd>
+              <dt>HNSW-indexed vectors</dt><dd>{{ '{:,}'.format(r.indexed) }}</dd>
+              <dt>Deferred points</dt><dd>{{ '{:,}'.format(r.deferred) }}</dd>
+              {% for vc in r.vector_configs %}
+              <dt>{{ vc.name }} · indexed / total</dt><dd>{{ '{:,}'.format(vc.num_indexed or 0) }} / {{ '{:,}'.format(vc.num_vectors or 0) }}</dd>
+              {% endfor %}
+            </dl>
+            {% if r.drift %}
+            <div class="mt-3 text-[#fbbf24]">▲ Differs from collection config:
+              <ul class="font-mono mt-1 space-y-0.5">{% for d in r.drift %}<li>{{ d }}</li>{% endfor %}</ul>
+              <p class="text-[#94a8c8] mt-1">The optimizer applies the current config when it next rebuilds this segment.</p>
+            </div>
+            {% endif %}
+          </div>
+          <div>
+            <div class="text-[0.6875rem] uppercase tracking-wider text-[#7b8fb5] mb-2">Payload indexes in this segment</div>
+            {% if r.payload_indexes %}
+            <table class="w-full text-xs">
+              <tbody>
+              {% for field, pi in r.payload_indexes | dictsort %}
+              <tr class="border-t border-[#1a2236]">
+                <td class="py-1 pr-3 font-mono text-[#38bdf8]">{{ field }}</td>
+                <td class="py-1 pr-3 font-mono text-[#94a8c8]">{{ pi.type }}</td>
+                <td class="py-1 text-right font-mono {% if pi.points == 0 %}text-[#fbbf24]{% endif %}">
+                  {{ '{:,}'.format(pi.points) if pi.points is number else '—' }}{% if r.points and pi.points is number %} <span class="text-[#7b8fb5]">· {{ (pi.points / r.points * 100) | round(1) }}%</span>{% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+            {% else %}<p class="text-[#94a8c8]">None.</p>{% endif %}
+          </div>
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="text-[0.6875rem] text-[#94a8c8] mt-2">
+  Appendable segments take new writes and stay plain until they pass indexing_threshold{% if indexing_threshold %} ({{ '{:,}'.format(indexing_threshold) }}){% endif %};
+  the optimizer then builds an immutable indexed segment. Qdrant does not expose on-disk file format versions through its API.
+</p>
+{% endif %}

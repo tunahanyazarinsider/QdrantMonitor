@@ -363,42 +363,10 @@
 </section>
 
 <!-- ── Segments ── -->
-<section class="qd-card p-5 mb-5">
-  <h2 class="hud-title">Segments <span class="hud-sub">{{ segments | length }} on this peer</span></h2>
-  <div class="overflow-x-auto">
-    <table class="qd-table w-full text-xs">
-      <thead><tr>
-        <th class="text-left px-3 py-2">Segment</th><th class="text-left px-3 py-2">Type</th>
-        <th class="text-right px-3 py-2">Points</th><th class="text-right px-3 py-2">Indexed</th>
-        <th class="text-right px-3 py-2">Deleted</th><th class="text-right px-3 py-2">Vectors</th>
-        <th class="text-right px-3 py-2">Payload</th><th class="text-left px-3 py-2">Storage</th>
-      </tr></thead>
-      <tbody>
-      {% for s in segments %}
-      {% set nv = s.num_vectors or 0 %}
-      <tr>
-        <td class="px-3 py-2 font-mono text-[#38bdf8]" title="{{ s.uuid }}">{{ (s.uuid or '')[:8] }}</td>
-        <td class="px-3 py-2">
-          <span class="badge {{ 'badge-green' if s.segment_type == 'indexed' else 'badge-yellow' if nv else '' }}">{{ s.segment_type }}</span>
-          {% if s.is_appendable %}<span class="text-[#7b8fb5] ml-1">appendable</span>{% endif %}
-        </td>
-        <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(s.num_points or 0) }}</td>
-        <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(s.num_indexed_vectors or 0) }}</td>
-        <td class="px-3 py-2 text-right font-mono {% if nv and (s.num_deleted_vectors or 0) / nv > 0.1 %}text-[#fbbf24]{% endif %}">
-          {{ '{:,}'.format(s.num_deleted_vectors or 0) }}{% if nv %} · {{ ((s.num_deleted_vectors or 0) / nv * 100) | round(1) }}%{% endif %}
-        </td>
-        <td class="px-3 py-2 text-right font-mono">{{ s.vectors_size_bytes | bytes }}</td>
-        <td class="px-3 py-2 text-right font-mono">{{ s.payloads_size_bytes | bytes }}</td>
-        <td class="px-3 py-2 font-mono text-[#7b8fb5]">
-          {% for vn, vd in (s.config.vector_data or {}).items() %}{{ vd.storage_type }}{% if not loop.last %}, {% endif %}{% endfor %}
-          {% if s.config.payload_storage_type %} · payload {{ s.config.payload_storage_type.type }}{% endif %}
-        </td>
-      </tr>
-      {% else %}
-      <tr><td colspan="8" class="px-3 py-4 text-[#7b8fb5]">Telemetry returned no segments for this collection on this peer.</td></tr>
-      {% endfor %}
-      </tbody>
-    </table>
+<section class="qd-card p-5 mb-5" id="health-segments">
+  <h2 class="hud-title">Segments <span class="hud-sub">state, index coverage, storage and config drift per segment</span></h2>
+  <div id="segments-content" hx-get="/api/{{ collection_name }}/segments" hx-trigger="load" hx-swap="innerHTML">
+    <div class="flex items-center gap-3 py-6 text-xs text-[#94a8c8]"><div class="qd-spinner"></div>Reading segment telemetry…</div>
   </div>
 </section>
 

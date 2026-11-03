@@ -241,7 +241,7 @@
         <tbody>
         {% for p in peers %}
         {% set lr = p.live_raft %}
-        {% set raft_off = lr and ((lr.leader is not none and lr.leader != raft.leader) or lr.term != raft.term) %}
+        {% set raft_off = lr and ((not lr.from_telemetry and lr.leader != raft.leader) or (lr.term is not none and lr.term != raft.term)) %}
         <tr>
           <td class="px-3 py-2 whitespace-nowrap">
             <span class="font-mono text-[#38bdf8]">{{ p.id }}</span>{% if p.is_self %} <span class="badge badge-blue ml-1">this</span>{% endif %}
