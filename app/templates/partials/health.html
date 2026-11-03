@@ -103,6 +103,60 @@
   </section>
 {% endif %}
 
+<!-- ── Placement ── -->
+{% if layout.grid and (layout.grid | length > 1 or layout.peers | length > 1) %}
+<section class="qd-card p-5 mb-5">
+  <h2 class="hud-title">Placement <span class="hud-sub">{{ layout.grid | length }} shard{{ 's' if layout.grid | length != 1 }} × {{ layout.peers | length }} peer{{ 's' if layout.peers | length != 1 }} · replication_factor {{ replication_factor }}</span></h2>
+  <div class="overflow-x-auto">
+    <table class="qd-table w-full text-xs">
+      <thead><tr>
+        <th class="text-left px-3 py-2">Shard</th>
+        <th class="text-right px-3 py-2">Points</th>
+        {% for p in layout.peers %}
+        <th class="text-left px-3 py-2 whitespace-nowrap">
+          …{{ p[-6:] }}{% if p == self_id %} <span class="normal-case text-[#7dd3fc]">this</span>{% endif %}{% if p == raft_leader %} <span class="normal-case text-[#f0abfc]">◆</span>{% endif %}
+        </th>
+        {% endfor %}
+      </tr></thead>
+      <tbody>
+      {% for g in layout.grid %}
+      <tr>
+        <td class="px-3 py-2 font-mono whitespace-nowrap">{{ g.shard_id }}{% if g.shard_key is not none %} <span class="badge badge-blue ml-1">{{ g.shard_key }}</span>{% endif %}</td>
+        <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(g.points) if g.points is number else '—' }}</td>
+        {% for p in layout.peers %}
+        {% set r = g.cells.get(p) %}
+        <td class="px-3 py-2 whitespace-nowrap">
+          {% if r %}
+          {% set st = r.consensus_state or r.state %}
+          <span class="tier {{ 'tier-cached' if st == 'Active' and not r.disagree else 'tier-pinned' }}"
+                title="{{ st }}{% if r.points is number %} · {{ '{:,}'.format(r.points) }} points{% endif %}{% if r.disagree %} · peers disagree{% endif %}">
+            {{ '●' if st == 'Active' and not r.disagree else '▲' }} {{ st or 'unknown' }}
+          </span>
+          {% if r.delta %}<span class="font-mono text-[#fbbf24] ml-1">{{ '{:+,}'.format(r.delta) }}</span>{% endif %}
+          {% else %}<span class="text-[#4b5f82]">·</span>{% endif %}
+        </td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+      </tbody>
+      <tfoot>
+        <tr class="border-t border-[#243049]">
+          <td class="px-3 py-2 text-[#7b8fb5]" colspan="2">Replicas · points held</td>
+          {% for p in layout.peers %}
+          {% set v = layout.per_peer[p] %}
+          <td class="px-3 py-2 font-mono text-[#d0dce8] whitespace-nowrap">{{ v.replicas }} · {{ '{:,}'.format(v.points) }}{% if v.sole_readable %} <span class="text-[#fbbf24]" title="only readable copy of {{ v.sole_readable }} shard(s)">▲{{ v.sole_readable }}</span>{% endif %}</td>
+          {% endfor %}
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+  <p class="text-[0.6875rem] text-[#7b8fb5] mt-2">
+    "·" means the peer holds no replica of that shard. ▲N in the footer: the peer holds the only readable copy of N shards.
+    {% if layout.keyed %}Custom shard keys are in use, so uneven shard sizes are expected and not flagged.{% endif %}
+  </p>
+</section>
+{% endif %}
+
 <!-- ── Replicas ── -->
 <section class="qd-card p-5 mb-5">
   {% set unver = replicas.unreachable %}
@@ -141,7 +195,7 @@
             <span class="font-mono text-[#38bdf8]">{{ r.peer }}</span>
             {% if r.peer == self_id %}<span class="badge badge-blue ml-1">this</span>{% endif %}
             {% if r.peer == raft_leader %}<span class="badge ml-1 text-[#f0abfc] border border-[rgba(240,171,252,0.3)] bg-[rgba(240,171,252,0.08)]">◆ leader</span>{% endif %}
-            <div class="text-[0.6875rem] font-mono text-[#7b8fb5]">{{ peer_bases.get(r.peer) or 'no endpoint' }}</div>
+            <div class="text-[0.6875rem] font-mono text-[#7b8fb5]">{{ peer_bases.get(r.peer) or ('via cluster telemetry' if r.source == 'cluster telemetry' else ('seen by other peers only' if r.seen else 'no data')) }}</div>
           </td>
           <td class="px-3 py-2">
             {% if r.state %}

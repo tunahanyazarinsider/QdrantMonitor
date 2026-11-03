@@ -1465,6 +1465,11 @@ def _d(v) -> dict:
     return v if isinstance(v, dict) else {}
 
 
+def _cluster_shards(cluster_telemetry, collection: str) -> list:
+    """Per-replica state and size of every peer, as gathered by the connected node."""
+    return _d(_d(_d(cluster_telemetry).get("collections")).get(collection)).get("shards") or []
+
+
 def _normalize_url(raw: str) -> str:
     raw = raw.strip().rstrip("/")
     return raw if raw.startswith(("http://", "https://")) else f"http://{raw}"
@@ -1497,6 +1502,10 @@ async def _replica_views(client: httpx.AsyncClient, bases: dict[str, str | None]
         if res is not None and pid != "local" and got and got != pid:
             errors.append(f"peer {pid}: endpoint {reachable[pid]} now serves peer {got}; remap it")
             continue
+        if pid == "local" and got:
+            # Cluster mode disabled: key the only node by the peer id its shards report.
+            views.pop("local", None)
+            pid = got
         views[pid] = _d(res) if res is not None else None
         if err:
             errors.append(f"peer {pid}: {err}")
@@ -1519,18 +1528,26 @@ async def api_peers_save(urls: str = Form("")):
     if not conn.connected:
         return RedirectResponse(url="/", status_code=303)
     candidates = [_normalize_url(u) for u in urls.replace(",", "\n").splitlines() if u.strip()]
-    async with httpx.AsyncClient(timeout=3) as client:
-        clus, _ = await _qget(client, "/cluster")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=0.5)) as client:
+        clus, cerr = await _qget(client, "/cluster")
         known = {str(p) for p in _d(_d(clus).get("peers"))}
         resolved = await asyncio.gather(*(_resolve_peer(client, u) for u in candidates))
-    mapped, skipped = {}, []
+    if not known:
+        return RedirectResponse(url=f"/cluster?msg={quote('Peer list unavailable; endpoints not changed. ' + (cerr or ''))}",
+                                status_code=303)
+    mapped, skipped, blips = {}, [], set()
     for url, pid in zip(candidates, resolved):
         if pid and pid in known:
             mapped[pid] = url
         else:
             skipped.append(url)
+            if pid is None:
+                blips.add(url)
     taken = set(mapped.values())
-    conn.peer_urls = {**{k: v for k, v in conn.peer_urls.items() if k not in known and v not in taken}, **mapped}
+    # Keep a mapping whose URL was submitted but did not answer (port-forward blip); drop everything else
+    # that was not re-confirmed, including peers that left the cluster.
+    kept = {k: v for k, v in conn.peer_urls.items() if k in known and k not in mapped and v in blips and v not in taken}
+    conn.peer_urls = {**kept, **mapped}
     _save_conn_state(conn.host, conn.port, conn.peer_urls)
     msg = f"Mapped {len(mapped)} peer(s)." + (f" Not part of this cluster or unreachable: {', '.join(skipped)}" if skipped else "")
     return RedirectResponse(url=f"/cluster?msg={quote(msg)}", status_code=303)
@@ -1572,7 +1589,7 @@ async def cluster_page(request: Request):
             (healthz, _), (readyz, e8), (snaps, e9) = await asyncio.gather(
                 _qget(client, "/telemetry?details_level=3"),
                 _qget(client, "/cluster"),
-                _qget(client, "/cluster/telemetry"),
+                _qget(client, "/cluster/telemetry?details_level=3"),
                 _qget(client, "/quotas", optional=True),
                 _qget(client, "/issues"),
                 _qget(client, "/metrics", raw=True),
@@ -1612,11 +1629,18 @@ async def cluster_page(request: Request):
         replica_results = await asyncio.gather(*(_replica_views(client, bases, cid, tele_by_peer) for cid in coll_ids))
     replicas_by_coll = {}
     replica_findings = []
+    rf_by_coll = {c.get("id"): _d(_d(c.get("config")).get("params")).get("replication_factor") or 1
+                  for c in _d(tele.get("collections")).get("collections") or []}
     for cid, (views, rstats, rerr) in zip(coll_ids, replica_results):
-        mx = insights.replica_matrix(views, rstats)
+        mx = insights.replica_matrix(views, rstats, _cluster_shards(cltele, cid))
         replicas_by_coll[cid] = mx
-        replica_findings += [(lvl, f"{cid}: {msg}") for lvl, msg in mx["findings"] if lvl != "info"]
-    unmapped = sorted(pid for pid, b in bases.items() if not b)
+        pl = insights.placement(mx, [p for p in views], rf_by_coll.get(cid, 1))
+        replica_findings += [(lvl, f"{cid}: {msg}") for lvl, msg in mx["findings"] + pl["findings"] if lvl != "info"]
+    replica_findings.sort(key=lambda f: {"error": 0, "warn": 1}.get(f[0], 2))
+    # Peers whose replicas no source (direct endpoint or /cluster/telemetry) reported.
+    unmapped = sorted({p for mx in replicas_by_coll.values() for p in mx["unreachable"]})
+    covered = {r["peer"] for mx in replicas_by_coll.values() for sh in mx["shards"] for r in sh["replicas"]
+               if r["source"] == "cluster telemetry"}
     stale = {pid: v["error"] for pid, v in peer_live.items() if v["error"] and "now serves peer" in v["error"]}
     errors_extra = list(stale.values())
     mem_by_coll = {cid: _d(m) for cid, (m, _) in zip(coll_ids, mem_results)}
@@ -1674,6 +1698,11 @@ async def cluster_page(request: Request):
         det = _d(peer_details.get(pid))
         live = peer_live.get(str(pid))
         live_raft = _d(_d(live["cluster"]).get("raft_info")) if live else {}
+        dd = _d(det.get("details"))
+        if not live_raft and dd.get("term") is not None:
+            # /cluster/telemetry carries each peer's own raft view but not whom it sees as leader.
+            live_raft = {"role": dd.get("role"), "term": dd.get("term"), "commit": dd.get("commit"),
+                         "pending_operations": dd.get("num_pending_operations"), "leader": None}
         live_metrics = insights.parse_prom(live["metrics"]) if live else {}
         peers.append({
             "id": pid,
@@ -1700,8 +1729,8 @@ async def cluster_page(request: Request):
     raft = _d(clus.get("raft_info"))
     versions = {p["version"] for p in peers if p["version"]}
     live_rafts = [p["live_raft"] for p in peers if p["live_raft"]]
-    leaders = {r.get("leader") for r in live_rafts}
-    terms = {r.get("term") for r in live_rafts}
+    leaders = {r.get("leader") for r in live_rafts if r.get("leader") is not None}
+    terms = {r.get("term") for r in live_rafts if r.get("term") is not None}
     quota_exceeded = {k: v for k, v in _d(_d(tele.get("quota")).get("exceeded")).items() if v}
     leader_id = str(raft.get("leader", "")) if raft.get("leader") is not None else ""
     leader_ep = bases.get(leader_id) if leader_id else None
@@ -1743,6 +1772,7 @@ async def cluster_page(request: Request):
         "leader_id": leader_id,
         "self_id": self_id,
         "unmapped": unmapped,
+        "covered": covered,
         "msg": request.query_params.get("msg", ""),
         "app_info": app_info,
         "system": system,
@@ -1774,13 +1804,16 @@ async def cluster_page(request: Request):
 
 @app.get("/api/cluster/sample")
 async def cluster_sample():
-    if not conn.connected:
-        return JSONResponse({"error": f"Not connected to Qdrant at {conn.host}:{conn.port}"}, status_code=503)
-    async with httpx.AsyncClient(timeout=10) as client:
-        txt, err = await _qget(client, "/metrics", raw=True)
-    if err:
-        return JSONResponse({"error": err}, status_code=502)
-    return {"ts": time.time(), **insights.sample(insights.parse_prom(txt))}
+    # Report what Qdrant answers right now; connection state is owned by connect() and the page routes.
+    where = f"{conn.host}:{conn.port}"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=2.0)) as client:
+            resp = await client.get(f"{_qdrant_base_url()}/metrics")
+    except httpx.HTTPError as exc:
+        return JSONResponse({"error": f"Qdrant at {where} unreachable: {type(exc).__name__}: {exc}"}, status_code=503)
+    if resp.status_code >= 400:
+        return JSONResponse({"error": f"Qdrant at {where} answered HTTP {resp.status_code}"}, status_code=502)
+    return {"ts": time.time(), **insights.sample(insights.parse_prom(resp.text))}
 
 
 @app.get("/api/{name}/health", response_class=HTMLResponse)
@@ -1807,10 +1840,14 @@ async def collection_health(request: Request, name: str):
         other_tele = await asyncio.gather(*(_qget(client, "/telemetry?details_level=3", base=b) for b in others.values()))
         tele_by_peer = {self_id: _d(tele), **{pid: _d(t) for pid, (t, _) in zip(others, other_tele)}}
         views, remote_stats, view_errors = await _replica_views(client, bases, name, tele_by_peer)
-        if "local" in bases and views.get("local"):
-            real = str(views["local"].get("peer_id") or "local")
-            bases, self_id = {real: bases["local"]}, real
-            views = {real: views["local"]}
+        cltele = None
+        if any(v is None for v in views.values()):
+            cltele, cterr = await _qget(client, "/cluster/telemetry?details_level=3")
+            if cterr:
+                view_errors.append(cterr)
+        if "local" in bases and "local" not in views and len(views) == 1:
+            self_id = next(iter(views))
+            bases = {self_id: bases["local"]}
         info = _d(info)
         facet_fields = [
             f for f, fi in _d(info.get("payload_schema")).items()
@@ -1832,7 +1869,9 @@ async def collection_health(request: Request, name: str):
 
     errors = [e for e in (e1, e2, e3, e4, e5, e6, e7) if e] + view_errors
     tele = _d(tele)
-    replicas = insights.replica_matrix(views, remote_stats)
+    replicas = insights.replica_matrix(views, remote_stats, _cluster_shards(cltele, name))
+    rf = _d(_d(info.get("config")).get("params")).get("replication_factor") or 1
+    layout = insights.placement(replicas, list(views), rf)
     raft_leader = str(_d(clus.get("raft_info")).get("leader") or "")
     coll_tele = next(
         (c for c in _d(tele.get("collections")).get("collections") or [] if c.get("id") == name), {}
@@ -1867,7 +1906,7 @@ async def collection_health(request: Request, name: str):
     return _render(request, "partials/health.html", {
         "errors": errors,
         "warnings": sorted(
-            replicas["findings"] + [
+            replicas["findings"] + layout["findings"] + [
                 w for w in insights.collection_warnings(
                     info, shard_info if isinstance(shard_info, dict) else None, segments, tiers, usage)
                 # replica_matrix reports shard state with every peer's view, so drop the single-peer duplicate.
@@ -1876,10 +1915,11 @@ async def collection_health(request: Request, name: str):
             key=lambda w: {"error": 0, "warn": 1}.get(w[0], 2),
         ),
         "replicas": replicas,
+        "layout": layout,
         "peer_bases": bases,
         "self_id": self_id,
         "raft_leader": raft_leader,
-        "replication_factor": _d(_d(info.get("config")).get("params")).get("replication_factor") or 1,
+        "replication_factor": rf,
         "states_info": insights.REPLICA_STATES,
         "shard_info": _d(shard_info),
         "optimizations": _d(opts),

@@ -52,7 +52,7 @@
 
 {% if replica_findings %}
 <section class="qd-card p-5 mb-8 border-[rgba(239,68,68,0.35)]">
-  <h2 class="hud-title">Replica findings <span class="hud-sub">from every reachable peer's own view{% if unmapped %} · {{ unmapped | length }} peer(s) not mapped{% endif %}</span></h2>
+  <h2 class="hud-title">Replica findings <span class="hud-sub">from each peer's own report{% if unmapped %} · {{ unmapped | length }} peer(s) without data{% endif %}</span></h2>
   <ul class="space-y-2 text-xs">
     {% for level, m in replica_findings %}
     <li class="flex items-start gap-3">
@@ -64,7 +64,7 @@
   </ul>
 </section>
 {% elif unmapped %}
-<div class="qd-card p-4 mb-8 text-xs text-[#fbbf24]">▲ {{ unmapped | length }} peer(s) have no reachable endpoint, so their replicas are unverified. <a href="#peer-endpoints" class="underline">Map endpoints</a>.</div>
+<div class="qd-card p-4 mb-8 text-xs text-[#fbbf24]">▲ No replica data for {{ unmapped | length }} peer(s) from any source. <a href="#peer-endpoints" class="underline">Map endpoints</a>.</div>
 {% endif %}
 
 <!-- ── Resources + Memory ── -->
@@ -241,7 +241,7 @@
         <tbody>
         {% for p in peers %}
         {% set lr = p.live_raft %}
-        {% set raft_off = lr and (lr.leader != raft.leader or lr.term != raft.term) %}
+        {% set raft_off = lr and ((lr.leader is not none and lr.leader != raft.leader) or lr.term != raft.term) %}
         <tr>
           <td class="px-3 py-2 whitespace-nowrap">
             <span class="font-mono text-[#38bdf8]">{{ p.id }}</span>{% if p.is_self %} <span class="badge badge-blue ml-1">this</span>{% endif %}
@@ -252,10 +252,12 @@
             {% if p.endpoint %}
               {% if p.live_error %}<span class="text-[#f87171]" title="{{ p.live_error }}">▲ {{ p.endpoint }}</span>
               {% else %}<span class="text-[#4ade80]">● {{ p.endpoint | replace('http://', '') }}</span>{% endif %}
+            {% elif p.id | string in unmapped %}<a href="#peer-endpoints" class="text-[#fbbf24] hover:text-[#00e5a0]">▲ no data · map endpoint</a>
+            {% elif p.id | string in covered %}<span class="text-[#7b8fb5]" title="Replica state and raft view come from /cluster/telemetry via the connected node; map an endpoint for RAM and slow-request data">via cluster telemetry</span>
             {% else %}<a href="#peer-endpoints" class="text-[#fbbf24] hover:text-[#00e5a0]">▲ not mapped</a>{% endif %}
           </td>
           <td class="px-3 py-2 font-mono whitespace-nowrap {% if raft_off %}text-[#f87171]{% endif %}">
-            {% if lr %}{{ lr.role }} · leader …{{ (lr.leader | string)[-4:] }} · t{{ lr.term }} · c{{ lr.commit }}{% if lr.pending_operations %} · {{ lr.pending_operations }} pending{% endif %}{% if raft_off %} ▲{% endif %}
+            {% if lr %}{{ lr.role }}{% if lr.leader is not none %} · leader …{{ (lr.leader | string)[-4:] }}{% endif %} · t{{ lr.term }} · c{{ lr.commit }}{% if lr.pending_operations %} · {{ lr.pending_operations }} pending{% endif %}{% if raft_off %} ▲{% endif %}
             {% else %}<span class="text-[#7b8fb5]">{{ p.role or '—' }}</span>{% endif %}
           </td>
           <td class="px-3 py-2 font-mono">{{ p.version or '—' }}</td>

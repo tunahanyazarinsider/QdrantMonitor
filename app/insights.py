@@ -211,13 +211,15 @@ def memory_usage(mem: dict, tiers: list[dict], payload_schema: dict | None = Non
     schema = payload_schema or {}
     rows: list[dict] = []
 
-    def add(group: str, name: str, part: str, usage, tier: dict | None, source: str = ""):
+    def add(group: str, name: str, part: str, usage, tier: dict | None, source: str = "") -> dict | None:
         u = _usage(usage)
         if u is None:
-            return
-        rows.append({"group": group, "name": name, "part": part,
-                     "tier": tier["tier"] if tier else None,
-                     "source": tier["source"] if tier else source, **u})
+            return None
+        row = {"group": group, "name": name, "part": part,
+               "tier": tier["tier"] if tier else None,
+               "source": tier["source"] if tier else source, **u}
+        rows.append(row)
+        return row
 
     for v in mem.get("vectors") or []:
         name = v.get("name", "")
@@ -238,13 +240,14 @@ def memory_usage(mem: dict, tiers: list[dict], payload_schema: dict | None = Non
             t = {"tier": "cold", "source": "on_disk (legacy)"}
         else:
             t = {"tier": "pinned", "source": "default"}
-        add("payload index", field, "", pi.get("usage"), t)
-        if rows and rows[-1]["name"] == field:
-            rows[-1]["indexed_points"] = (schema.get(field) or {}).get("points")
+        row = add("payload index", field, "", pi.get("usage"), t)
+        if row is not None:
+            row["indexed_points"] = (schema.get(field) or {}).get("points")
     for name, usage in (mem.get("other") or {}).items():
         add("other", name, "", usage, {"tier": "pinned", "source": "default"} if name == "id_tracker" else None)
 
     total = _usage(mem.get("total")) or {k: sum(r[k] for r in rows) for k in _USAGE_KEYS}
+    total.setdefault("warm_cached_bytes", 0)
     # Cache held by cold parts (expected 0) must not count toward warmth of the parts that need it.
     if rows:
         total["warm_cached_bytes"] = sum(r["warm_cached_bytes"] for r in rows)
@@ -281,16 +284,19 @@ REPLICA_STATES: dict[str, dict] = {
 }
 
 
-def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] | None = None) -> dict:
+def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] | None = None,
+                   cluster_shards: list | None = None) -> dict:
     """views: peer_id -> that peer's GET /collections/{c}/cluster result (None if not reachable).
-    remote_stats: viewer peer_id -> telemetry shards[].remote[] (per-replica search/update counters)."""
+    remote_stats: viewer peer_id -> telemetry shards[].remote[] (per-replica search/update counters).
+    cluster_shards: GET /cluster/telemetry?details_level=3 collections[c].shards, which the connected node
+    gathers from every peer; it fills replicas whose own peer is not reachable directly."""
     remote_stats = remote_stats or {}
     shards: dict[int, dict[str, dict]] = {}
 
     def slot(shard_id, peer):
         return shards.setdefault(shard_id, {}).setdefault(str(peer), {
             "peer": str(peer), "state": None, "points": None, "shard_key": None,
-            "seen": {}, "ops": {},
+            "seen": {}, "ops": {}, "source": None,
         })
 
     for viewer, info in views.items():
@@ -300,11 +306,22 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
         for ls in info.get("local_shards") or []:
             r = slot(ls.get("shard_id"), viewer)
             r["state"], r["points"], r["shard_key"] = ls.get("state"), ls.get("points_count"), ls.get("shard_key")
+            r["source"] = "peer"
             r["seen"][viewer] = ls.get("state")
         for rs in info.get("remote_shards") or []:
             r = slot(rs.get("shard_id"), rs.get("peer_id"))
             r["seen"][viewer] = rs.get("state")
             r["shard_key"] = r["shard_key"] or rs.get("shard_key")
+
+    for sh in cluster_shards or []:
+        for rp in sh.get("replicas") or []:
+            if rp.get("peer_id") is None:
+                continue
+            r = slot(sh.get("id"), rp.get("peer_id"))
+            if r["state"] is None:
+                r["state"], r["points"] = rp.get("state"), rp.get("num_points")
+                r["source"] = "cluster telemetry"
+                r["seen"].setdefault(r["peer"], rp.get("state"))
 
     for viewer, remotes in remote_stats.items():
         for rm in remotes or []:
@@ -351,11 +368,55 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
             findings.append(("error", f"Shard {shard_id} has no readable replica: reads of this shard fail."))
         out.append({"shard_id": shard_id, "replicas": replicas, "readable": readable, "total": len(replicas),
                     "max_points": top})
-    unreachable = sorted(str(p) for p, v in views.items() if v is None)
+    covered = {r["peer"] for sh in out for r in sh["replicas"] if r["state"] is not None}
+    unreachable = sorted(str(p) for p, v in views.items() if v is None and str(p) not in covered)
     if unreachable:
-        findings.append(("info", f"No endpoint for peer(s) {', '.join(unreachable)}: their own replica state and point counts are not verified."))
+        findings.append(("info", f"No data for peer(s) {', '.join(unreachable)}: their replica state and point counts are not verified."))
     findings.sort(key=lambda f: {"error": 0, "warn": 1}.get(f[0], 2))
     return {"shards": out, "findings": findings, "unreachable": unreachable}
+
+
+def placement(matrix: dict, peers: list[str], replication_factor: int) -> dict:
+    """Shard × peer layout plus balance checks; built on replica_matrix() output."""
+    shards = matrix.get("shards") or []
+    peers = sorted(set(peers) | {r["peer"] for sh in shards for r in sh["replicas"]})
+    grid, findings = [], []
+    per_peer = {p: {"replicas": 0, "points": 0, "sole_readable": 0} for p in peers}
+    keyed = any(r.get("shard_key") is not None for sh in shards for r in sh["replicas"])
+
+    for sh in shards:
+        cells = {r["peer"]: r for r in sh["replicas"]}
+        grid.append({"shard_id": sh["shard_id"], "shard_key": next((r["shard_key"] for r in sh["replicas"] if r.get("shard_key") is not None), None),
+                     "points": sh["max_points"], "cells": cells})
+        for r in sh["replicas"]:
+            per_peer[r["peer"]]["replicas"] += 1
+            per_peer[r["peer"]]["points"] += r["points"] or 0
+        readable = [r for r in sh["replicas"] if r["readable"]]
+        under = sh["total"] < replication_factor
+        if len(readable) == 1 and not under:
+            per_peer[readable[0]["peer"]]["sole_readable"] += 1
+        if under:
+            findings.append(("warn", f"Shard {sh['shard_id']} has {sh['total']} replica(s), below replication_factor={replication_factor}."))
+
+    sizes = [g["points"] for g in grid if g["points"] is not None]
+    if len(sizes) > 1 and not keyed and sum(sizes) >= 1000:
+        mean = sum(sizes) / len(sizes)
+        for g in grid:
+            if g["points"] is not None and mean and g["points"] / mean >= 1.5:
+                findings.append(("warn", f"Shard {g['shard_id']} holds {g['points']:,} points, {g['points'] / mean:.1f}× the shard average."))
+
+    counts = [v["replicas"] for v in per_peer.values()]
+    if len(per_peer) > 1 and counts and max(counts) - min(counts) > 1 and not keyed:
+        heavy = max(per_peer, key=lambda p: per_peer[p]["replicas"])
+        light = min(per_peer, key=lambda p: per_peer[p]["replicas"])
+        findings.append(("warn", f"Replica placement is uneven: peer {heavy} holds {per_peer[heavy]['replicas']}, "
+                                 f"peer {light} holds {per_peer[light]['replicas']}."))
+    for p, v in per_peer.items():
+        # With replication_factor=1 every shard has one copy by design; that is reported elsewhere.
+        if v["sole_readable"] and replication_factor > 1:
+            findings.append(("warn", f"Peer {p} holds the only readable replica of {v['sole_readable']} shard(s): "
+                                     "if it goes down those shards cannot be read."))
+    return {"peers": peers, "grid": grid, "per_peer": per_peer, "findings": findings, "keyed": keyed}
 
 
 def _segment_infos(segments: list) -> list[dict]:
@@ -552,4 +613,46 @@ if __name__ == "__main__":
         "index": {"disk_bytes": 1, "ram_bytes": 0, "cached_bytes": 0, "expected_cache_bytes": 1000}}],
         "total": {"disk_bytes": 2, "ram_bytes": 0, "cached_bytes": 1000, "expected_cache_bytes": 1000}}, [])
     assert cold_hides["total"]["warm_pct"] == 0.0, cold_hides["total"]
+    odd = memory_usage({"something_else": 1}, [])
+    assert odd["rows"] == [] and odd["total"]["warm_cached_bytes"] == 0 and odd["total"]["warm_pct"] is None
+    skip = memory_usage({"vectors": [{"name": "brand", "quantized": {"disk_bytes": 1}}],
+                         "payload_index": [{"name": "brand", "usage": None}]}, [], {"brand": {"points": 7}})
+    assert all("indexed_points" not in r for r in skip["rows"]), skip["rows"]
+    via_ct = replica_matrix({A: views[A], B: None, C: None}, None, [{"id": 0, "replicas": [
+        {"peer_id": int(A), "state": "Active", "num_points": 0},
+        {"peer_id": int(B), "state": "Active", "num_points": 991806},
+        {"peer_id": int(C), "state": "Active", "num_points": 991806}]}])
+    vr = {r["peer"]: r for r in via_ct["shards"][0]["replicas"]}
+    assert vr[B]["points"] == 991806 and vr[B]["source"] == "cluster telemetry" and vr[A]["source"] == "peer"
+    assert via_ct["unreachable"] == [] and vr[A]["delta"] == -991806
+    # 6 shards × RF 2 over 3 peers: shard 5 under-replicated and skewed, shard 2 has one Dead copy.
+    P = ["p1", "p2", "p3"]
+    def rep_(sid, peer, pts, st="Active"):
+        return {"shard_id": sid, "points_count": pts, "state": st}
+    views6 = {p: {"peer_id": p, "local_shards": [], "remote_shards": []} for p in P}
+    layout = {0: ["p1", "p2"], 1: ["p2", "p3"], 2: ["p3", "p1"], 3: ["p1", "p2"], 4: ["p2", "p3"], 5: ["p1"]}
+    for sid, holders in layout.items():
+        for h in holders:
+            st = "Dead" if (sid == 2 and h == "p1") else "Active"
+            pts = 50000 if sid == 5 else 10000
+            views6[h]["local_shards"].append(rep_(sid, h, pts, st))
+            for other in P:
+                if other != h:
+                    views6[other]["remote_shards"].append({"shard_id": sid, "peer_id": h, "state": st})
+    mx6 = replica_matrix(views6)
+    pl = placement(mx6, P, 2)
+    pm = [m for _, m in pl["findings"]]
+    assert len(pl["grid"]) == 6 and pl["per_peer"]["p1"]["replicas"] == 4 and pl["per_peer"]["p3"]["replicas"] == 3
+    assert any("Shard 5 has 1 replica" in m for m in pm)
+    assert any("Shard 5 holds 50,000" in m for m in pm)
+    assert any("Peer p3 holds the only readable replica of 1" in m for m in pm), pm
+    assert not any("Peer p1 holds the only readable replica" in m for m in pm), pm
+    kv = {"a": {"peer_id": "a", "local_shards": [{"shard_id": i, "points_count": 1, "state": "Active", "shard_key": f"k{i}"} for i in range(3)]},
+          "b": {"peer_id": "b", "local_shards": []}}
+    assert placement(replica_matrix(kv), ["a", "b"], 1)["findings"] == []
+    ro = replica_matrix({"a": {"peer_id": "a", "local_shards": [], "remote_shards": [{"shard_id": 0, "peer_id": "b", "state": "Active"}]}, "b": None})
+    assert ro["shards"][0]["replicas"][0]["source"] is None
+    assert any("Dead" in m for _, m in mx6["findings"]) and mx6["shards"][2]["readable"] == 1
+    single = placement(replica_matrix({"x": {"peer_id": "x", "local_shards": [{"shard_id": 0, "points_count": 5, "state": "Active"}]}}), ["x"], 1)
+    assert single["findings"] == [], single["findings"]
     print("ok")
