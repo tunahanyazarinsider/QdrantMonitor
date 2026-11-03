@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "partials/macros.html" as m %}
 {% block title %}Cluster — Qdrant Monitor{% endblock %}
 
 {% macro meter(pct, warn=70, bad=90) -%}
@@ -90,8 +91,7 @@
           <div class="text-[0.6875rem] text-[#94a8c8]">{{ c.shards }} shard{{ 's' if c.shards != 1 }} × RF {{ c.replication }}</div></td>
         <td class="px-3 py-2 align-top">
           {% set cs = c.coll_status %}
-          <span class="badge {{ cs | status_badge }}"
-                title="{{ status_meaning.get(cs, '') }}">{{ '●' if cs == 'green' else '▲' }} {{ cs or 'unknown' }}</span>
+          {{ m.status_badge(cs, status_meaning) }}
           {% if c.optimizer_error %}<div class="text-[0.6875rem] text-[#f87171] mt-1" title="{{ c.optimizer_error }}">▲ optimizer error</div>{% endif %}
         </td>
         {% for p in peer_ids %}
@@ -393,8 +393,7 @@
         <td class="px-3 py-2"><a href="/collection/{{ c.name }}" class="font-mono text-[#38bdf8] hover:text-[#00e5a0]">{{ c.name }}</a></td>
         <td class="px-3 py-2">
           {% set cs = c.coll_status %}
-          <span class="badge {{ cs | status_badge }}"
-                title="{{ status_meaning.get(cs, '') }}">{{ '●' if cs == 'green' else '▲' }} {{ cs or 'unknown' }}</span>
+          {{ m.status_badge(cs, status_meaning) }}
         </td>
         <td class="px-3 py-2 whitespace-nowrap">
           {% if c.optimizer_error %}<span class="badge badge-red" title="{{ c.optimizer_error }}">▲ error</span>
@@ -403,7 +402,7 @@
         {% set mx = c.replicas %}
         {% set cluster_points = c.cluster_points %}
         <td class="px-3 py-2 text-right font-mono" title="{{ '{:,}'.format(c.points) }} on this peer">
-          {{ '{:,}'.format(cluster_points if cluster_points is not none else c.points) }}
+          {{ '{:,}'.format(cluster_points) }}
           {% if cluster_points is not none and cluster_points != c.points %}<div class="text-[0.6875rem] text-[#fbbf24]">▲ {{ '{:,}'.format(c.points) }} here</div>{% endif %}
         </td>
         <td class="px-3 py-2 font-mono">{{ c.shards }} × {{ c.replication }}{% if c.transfers %} <span class="badge badge-yellow">{{ c.transfers }} transfer</span>{% endif %}</td>

@@ -1605,7 +1605,9 @@ async def _skip():
 async def _cluster_state(request: Request, full: bool = True) -> dict:
     """Everything the cluster page shows; all Qdrant calls run in parallel.
     full=False (overview page) skips snapshots, the slow-request log and per-peer metrics."""
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=2.0)) as client:
+    # Many collections x peers fan out here; cap open connections and let the rest wait in the pool.
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=2.0, pool=120.0),
+                                 limits=httpx.Limits(max_connections=16)) as client:
         (tele, e1), (clus, e2), (cltele, e3), (quotas, e4), (issues, e5), (metrics_txt, e6), \
             (healthz, _), (readyz, e8), (snaps, e9) = await asyncio.gather(
                 _qget(client, "/telemetry?details_level=3"),
@@ -1620,6 +1622,9 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
             )
         tele = _d(tele)
         coll_ids = [c.get("id") for c in _d(tele.get("collections")).get("collections") or [] if c.get("id")]
+        if not coll_ids:
+            listed, _ = await _qget(client, "/collections")
+            coll_ids = [c.get("name") for c in _d(listed).get("collections") or [] if c.get("name")]
         (slow, e10), *rest = await asyncio.gather(
             _qget(client, "/profiler/slow_requests?limit=20", optional=True) if full else _skip(),
             *(_qget(client, f"/collections/{quote(cid, safe='')}/memory") for cid in coll_ids),
@@ -1628,6 +1633,10 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
         mem_results, info_results = rest[:len(coll_ids)], rest[len(coll_ids):]
         info_by_coll = {cid: _d(res) for cid, (res, _) in zip(coll_ids, info_results)}
         info_err_by_coll = {cid: err for cid, (_, err) in zip(coll_ids, info_results) if err}
+        if not _d(tele.get("collections")).get("collections") and coll_ids:
+            # Telemetry failed or is denied: build rows from collection info so the list survives.
+            tele.setdefault("collections", {})["collections"] = [
+                {"id": cid, "config": _d(info_by_coll.get(cid)).get("config"), "shards": []} for cid in coll_ids]
 
         self_id = str(_d(clus).get("peer_id") or "")
         bases = {str(pid): (_qdrant_base_url() if str(pid) == self_id else conn.peer_urls.get(str(pid)))
@@ -1728,7 +1737,8 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
             "info_error": info_err_by_coll.get(c.get("id")),
             "indexed_vectors": info_by_coll.get(c.get("id"), {}).get("indexed_vectors_count"),
             "segments_count": info_by_coll.get(c.get("id"), {}).get("segments_count"),
-            "vectors_total": _cluster_vectors(cltele, c.get("id")) or (sum(nbyname.values()) if nbyname else None),
+            "vectors_total": _cluster_vectors(cltele, c.get("id"))
+                             or (sum(nbyname.values()) if nbyname and len(bases) <= 1 else None),
             "vec_names": [{"name": n or "(default)", "size": v.get("size"), "distance": v.get("distance")}
                           for n, v in insights.vector_configs(cfg_params).items()],
             "sparse_names": list(_d(cfg_params.get("sparse_vectors"))),
@@ -1816,7 +1826,7 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
          or "ok"),
     ]
 
-    unreachable = bool(e1 and e2 and ": HTTP " not in e1 and ": HTTP " not in e2)
+    unreachable = bool(e1 and e2 and all("ConnectError" in e or "ConnectTimeout" in e for e in (e1, e2)))
     for row in coll_rows:
         mine = [lvl for cid, lvl, _ in status_triples + replica_triples if cid == row["name"]]
         row["errors"], row["warnings"] = mine.count("error"), mine.count("warn")

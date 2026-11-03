@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "partials/macros.html" as m %}
 {% block title %}Dashboard — Qdrant Monitor{% endblock %}
 
 {% block content %}
@@ -275,14 +276,13 @@ document.getElementById('migrate-form')?.addEventListener('submit', async functi
           {% if c.info_error %}<div class="text-[0.6875rem] text-[#f87171]" title="{{ c.info_error }}">▲ info unavailable</div>{% endif %}</td>
         <td class="px-3 py-2 whitespace-nowrap">
           {% set cs = c.coll_status %}
-          <span class="badge {{ cs | status_badge }}"
-                title="{{ status_meaning.get(cs, '') }}">{{ '●' if cs == 'green' else '▲' }} {{ cs or 'unknown' }}</span>
+          {{ m.status_badge(cs, status_meaning) }}
           <div class="text-[0.6875rem] mt-1 {{ 'text-[#f87171]' if c.optimizer_error else 'text-[#94a8c8]' }}" {% if c.optimizer_error %}title="{{ c.optimizer_error }}"{% endif %}>
             optimizer {% if c.optimizer_error %}▲ error{% elif c.optimizer_known %}ok{% else %}—{% endif %}{% if c.running_opt %} · <span class="text-[#fbbf24]">{{ c.running_opt | int }} running</span>{% endif %}
           </div>
         </td>
         <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(c.cluster_points) }}
-          {% if c.vectors_total and c.vectors_total > c.cluster_points %}<div class="text-[0.6875rem] text-[#94a8c8]" title="vectors include deleted ones until the optimizer vacuums them">{{ '{:,}'.format(c.vectors_total) }} vectors</div>{% endif %}</td>
+          {% if c.vectors_total and c.vec_names | length == 1 and not c.sparse_names and c.vectors_total > c.cluster_points %}<div class="text-[0.6875rem] text-[#94a8c8]" title="vectors include deleted ones until the optimizer vacuums them">{{ '{:,}'.format(c.vectors_total) }} vectors</div>{% endif %}</td>
         <td class="px-3 py-2 font-mono whitespace-nowrap">
           {% for v in c.vec_names %}<div><span class="text-[#38bdf8]">{{ v.name }}</span> <span class="text-[#94a8c8]">{{ v.size }}d · {{ v.distance }}</span></div>{% endfor %}
           {% for n in c.sparse_names %}<div><span class="text-[#f59e0b]">{{ n }}</span> <span class="text-[#94a8c8]">sparse</span></div>{% endfor %}
@@ -319,7 +319,7 @@ document.getElementById('migrate-form')?.addEventListener('submit', async functi
         </td>
         <td class="px-2 py-2">
           <form action="/api/collections/{{ c.name }}/delete" method="post"
-                onsubmit="return confirm('Delete collection {{ c.name }}? This is irreversible.')">
+                onsubmit='return confirm({{ ("Delete collection " ~ c.name ~ "? This is irreversible.") | tojson }})'>
             <button type="submit" class="text-[#94a8c8] hover:text-[#f87171] text-xs px-2 py-1 rounded hover:bg-[rgba(248,113,113,0.08)]"
                     title="Delete collection {{ c.name }}" aria-label="Delete collection {{ c.name }}">✕</button>
           </form>

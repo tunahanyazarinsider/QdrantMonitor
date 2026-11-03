@@ -391,6 +391,10 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
             r["delta"] = (r["points"] - top) if top is not None and r["points"] is not None else None
             readable += bool(r["readable"])
             label = f"shard {shard_id} on peer {r['peer']}"
+            if r["state"] is None and isinstance(views.get(r["peer"]), dict) and r["seen"]:
+                r["missing"] = True
+                findings.append(("error", f"{label} is assigned by other peers but peer {r['peer']} does not list it locally: "
+                                          "the replica is missing on that node."))
             if r["disagree"]:
                 by = ", ".join(f"{v} → {s}" for v, s in sorted(r["seen"].items()))
                 if relayed_conflict:
@@ -414,7 +418,7 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
             findings.append(("error", f"Shard {shard_id} has no readable replica: reads of this shard fail."))
         out.append({"shard_id": shard_id, "replicas": replicas, "readable": readable, "total": len(replicas),
                     "max_points": top})
-    unverified = {r["peer"] for sh in out for r in sh["replicas"] if r["state"] is None}
+    unverified = {r["peer"] for sh in out for r in sh["replicas"] if r["state"] is None and not r.get("missing")}
     if cluster_shards is None:
         unverified |= {str(p) for p, v in views.items() if v is None}
     unreachable = sorted(unverified)
@@ -500,7 +504,7 @@ def placement(matrix: dict, peers: list[str], replication_factor: int) -> dict:
 def vector_configs(params: dict) -> dict:
     """name -> vector params; the unnamed default vector is keyed ""."""
     vectors = (params or {}).get("vectors") or {}
-    return {"": vectors} if "size" in vectors else {k: v for k, v in vectors.items() if isinstance(v, dict)}
+    return {"": vectors} if isinstance(vectors.get("size"), int) else {k: v for k, v in vectors.items() if isinstance(v, dict)}
 
 
 def _hnsw_expected(config: dict, vector_name: str) -> dict:
@@ -572,7 +576,11 @@ def segment_analysis(segments: list, config: dict) -> dict:
             "vector_configs": vectors, "payload_indexes": pidx,
             "drift": [d for v in vectors for d in v["drift"]],
         }
-        plain_kib = (info.get("vectors_size_bytes") or 0) / 1024 * (n_vec - n_idx) / n_vec if n_vec > n_idx else 0
+        # Approximation: telemetry gives bytes per segment, counts per vector name; the threshold applies per name.
+        per_vec_kib = (info.get("vectors_size_bytes") or 0) / 1024 / n_vec if n_vec else 0
+        per_name_unindexed = [(v["num_vectors"] - (v["num_indexed"] or 0)) if v["num_vectors"] is not None else n_vec - n_idx
+                              for v in vectors] or [n_vec - n_idx]
+        plain_kib = max(per_name_unindexed) * per_vec_kib if n_vec > n_idx else 0
         row["plain_kib"] = plain_kib
         row["over_threshold"] = bool(isinstance(threshold_kib, (int, float)) and threshold_kib and plain_kib >= threshold_kib)
         rows.append(row)
@@ -896,4 +904,13 @@ if __name__ == "__main__":
     assert list(vector_configs({"vectors": {"a": {"size": 1}, "b": {"size": 2}}})) == ["a", "b"]
     grey = replica_matrix({"a": {"peer_id": "a", "local_shards": [{"shard_id": 0, "points_count": 1, "state": "Active"}]}}, None, None, {(0, "a"): "grey"})
     assert ("warn", "shard 0 on peer a is grey: " + COLLECTION_STATUS["grey"]) in grey["findings"], grey["findings"]
+    miss = replica_matrix({"a": {"peer_id": "a", "local_shards": [], "remote_shards": [{"shard_id": 0, "peer_id": "b", "state": "Active"}]},
+                           "b": {"peer_id": "b", "local_shards": [], "remote_shards": []}})
+    assert miss["unreachable"] == [] and any("missing on that node" in m_ for _, m_ in miss["findings"]), miss
+    two = {"_shard": 0, "info": {"uuid": "tw", "segment_type": "plain", "num_points": 15000, "num_vectors": 30000,
+                                 "num_indexed_vectors": 0, "vectors_size_bytes": 30000 * 1024, "is_appendable": True},
+           "config": {"vector_data": {"a": {"index": {"type": "plain"}}, "b": {"index": {"type": "plain"}}}}}
+    two["info"]["vector_data"] = {"a": {"num_vectors": 15000, "num_indexed_vectors": 0}, "b": {"num_vectors": 15000, "num_indexed_vectors": 0}}
+    assert not segment_analysis([two], seg_cfg)["rows"][0]["over_threshold"]
+    assert list(vector_configs({"vectors": {"size": {"size": 3}, "title": {"size": 4}}})) == ["size", "title"]
     print("ok")

@@ -8,7 +8,7 @@
   {% for p in peers %}
   <button type="button" role="tab" aria-selected="{{ 'true' if p == peer else 'false' }}"
           class="px-3 py-1 rounded font-mono border {{ 'border-[#00e5a0] text-[#00e5a0] bg-[rgba(0,229,160,0.08)]' if p == peer else 'border-[#243049] text-[#94a8c8] hover:text-white' }}"
-          hx-get="/api/{{ collection_name }}/segments?peer={{ p }}" hx-target="#segments-content" hx-swap="innerHTML"
+          hx-get="/api/{{ collection_name | urlencode }}/segments?peer={{ p | urlencode }}" hx-target="#segments-content" hx-swap="innerHTML"
           title="{{ p }}">…{{ p[-6:] }}{% if p == self_id %} · this{% endif %}</button>
   {% endfor %}
 </div>
