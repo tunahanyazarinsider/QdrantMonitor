@@ -293,6 +293,9 @@ COLLECTION_STATUS = {
 }
 
 
+STATUS_LEVEL = {"red": "error", "grey": "warn", "yellow": "info"}
+
+
 def optimizer_error(optimizer_status) -> str | None:
     if optimizer_status in (None, "ok"):
         return None
@@ -305,7 +308,7 @@ def status_warnings(info: dict) -> list[tuple[str, str]]:
     out = []
     status = info.get("status")
     if status and status != "green":
-        out.append(({"red": "error", "yellow": "info", "grey": "warn"}.get(status, "warn"),
+        out.append((STATUS_LEVEL.get(status, "warn"),
                     f"Collection status is {status}: {COLLECTION_STATUS.get(status, 'unknown status.')}"))
     opt_err = optimizer_error(info.get("optimizer_status"))
     if opt_err:
@@ -398,7 +401,7 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
                 lvl = "error" if not REPLICA_STATES.get(s, {}).get("readable") else "warn"
                 findings.append((lvl, f"{label} is {s}: {REPLICA_STATES.get(s, {}).get('meaning', 'unknown state')}"))
             if r["status"] in ("yellow", "grey", "red"):
-                findings.append(({"red": "error"}.get(r["status"], "info"),
+                findings.append((STATUS_LEVEL[r["status"]],
                                  f"{label} is {r['status']}: {COLLECTION_STATUS.get(r['status'], '')}"))
             if top and r["points"] == 0:
                 findings.append(("error", f"{label} holds 0 points while another replica holds {top:,}."))
@@ -494,17 +497,21 @@ def placement(matrix: dict, peers: list[str], replication_factor: int) -> dict:
     return {"peers": peers, "grid": grid, "per_peer": per_peer, "findings": findings, "keyed": keyed}
 
 
+def vector_configs(params: dict) -> dict:
+    """name -> vector params; the unnamed default vector is keyed ""."""
+    vectors = (params or {}).get("vectors") or {}
+    return {"": vectors} if "size" in vectors else {k: v for k, v in vectors.items() if isinstance(v, dict)}
+
+
 def _hnsw_expected(config: dict, vector_name: str) -> dict:
     base = dict(config.get("hnsw_config") or {})
-    vectors = (config.get("params") or {}).get("vectors") or {}
-    vcfg = vectors if "size" in vectors else vectors.get(vector_name) or {}
+    vcfg = vector_configs(config.get("params")).get(vector_name) or {}
     base.update({k: v for k, v in (vcfg.get("hnsw_config") or {}).items() if v is not None})
     return base
 
 
 def _quant_expected(config: dict, vector_name: str) -> str | None:
-    vectors = (config.get("params") or {}).get("vectors") or {}
-    vcfg = vectors if "size" in vectors else vectors.get(vector_name) or {}
+    vcfg = vector_configs(config.get("params")).get(vector_name) or {}
     q = _quantization_kind(vcfg.get("quantization_config") or config.get("quantization_config"))
     return q[0] if q else None
 
@@ -885,4 +892,8 @@ if __name__ == "__main__":
                              None, [{"id": 0, "replicas": [{"peer_id": "b", "num_points": 5}]}])
     assert nostate["shards"][0]["replicas"][0]["source"] is None
     assert status_warnings({"status": "green", "optimizer_status": "ok"}) == []
+    assert vector_configs({"vectors": {"size": 4}}) == {"": {"size": 4}}
+    assert list(vector_configs({"vectors": {"a": {"size": 1}, "b": {"size": 2}}})) == ["a", "b"]
+    grey = replica_matrix({"a": {"peer_id": "a", "local_shards": [{"shard_id": 0, "points_count": 1, "state": "Active"}]}}, None, None, {(0, "a"): "grey"})
+    assert ("warn", "shard 0 on peer a is grey: " + COLLECTION_STATUS["grey"]) in grey["findings"], grey["findings"]
     print("ok")

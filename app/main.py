@@ -451,6 +451,9 @@ async def dashboard(request: Request):
     if not conn.connected:
         return _render(request, "dashboard.html", {"collections": [], "total_points": 0, "conn": conn, "health": []})
     state = await _cluster_state(request, full=False)
+    if state["unreachable"]:
+        conn.connected, conn.error = False, state["errors"][0] if state["errors"] else "Qdrant unreachable"
+        return _render(request, "dashboard.html", {"collections": [], "total_points": 0, "conn": conn, "health": []})
     state["total_points"] = sum(r["cluster_points"] for r in state["collections"])
     return _render(request, "dashboard.html", state)
 
@@ -1425,6 +1428,8 @@ def _fmt_bytes(n) -> str:
 
 
 templates.env.filters["bytes"] = _fmt_bytes
+templates.env.filters["status_badge"] = lambda st: {
+    "green": "badge-green", "yellow": "badge-yellow", "grey": "badge-blue", "red": "badge-red"}.get(st, "")
 
 
 async def _qget(client: httpx.AsyncClient, path: str, raw: bool = False,
@@ -1471,10 +1476,11 @@ def _cluster_vectors(cluster_telemetry, collection: str) -> int | None:
                for sh in shards)
 
 
-def _cluster_points(matrix: dict | None, local_points: int) -> int:
+def _cluster_points(matrix: dict | None, info_points, local_points: int) -> int:
     shards = (matrix or {}).get("shards") or []
-    known = [sh["max_points"] for sh in shards if sh["max_points"] is not None]
-    return sum(known) if known else local_points
+    if shards and all(sh["max_points"] is not None for sh in shards):
+        return sum(sh["max_points"] for sh in shards)
+    return info_points if isinstance(info_points, int) else local_points
 
 
 def _normalize_url(raw: str) -> str:
@@ -1604,7 +1610,7 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
             (healthz, _), (readyz, e8), (snaps, e9) = await asyncio.gather(
                 _qget(client, "/telemetry?details_level=3"),
                 _qget(client, "/cluster"),
-                _qget(client, "/cluster/telemetry?details_level=3"),
+                _qget(client, "/cluster/telemetry?details_level=3", optional=True),
                 _qget(client, "/quotas", optional=True),
                 _qget(client, "/issues"),
                 _qget(client, "/metrics", raw=True),
@@ -1626,6 +1632,8 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
         self_id = str(_d(clus).get("peer_id") or "")
         bases = {str(pid): (_qdrant_base_url() if str(pid) == self_id else conn.peer_urls.get(str(pid)))
                  for pid in _d(_d(clus).get("peers"))}
+        if not full:
+            bases = {pid: (b if pid == self_id else None) for pid, b in bases.items()}
         others = {pid: b for pid, b in bases.items() if b and pid != self_id}
         peer_fetch = await asyncio.gather(*(
             asyncio.gather(_qget(client, "/cluster", base=b), _qget(client, "/telemetry?details_level=3", base=b),
@@ -1646,6 +1654,8 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
             bases["local"] = _qdrant_base_url()
         tele_by_peer = {pid: v["telemetry"] for pid, v in peer_live.items()}
         replica_results = await asyncio.gather(*(_replica_views(client, bases, cid, tele_by_peer) for cid in coll_ids))
+    if not self_id:
+        self_id = next((p for views, *_ in replica_results for p in views if p != "local"), "")
     replicas_by_coll, replica_peers = {}, {}
     replica_triples, status_triples = [], []
     rf_by_coll = {c.get("id"): _d(_d(c.get("config")).get("params")).get("replication_factor") or 1
@@ -1659,7 +1669,7 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
         replica_triples += [(cid, lvl, msg) for lvl, msg in mx["findings"] + pl["findings"] if lvl != "info"]
     rank = {"error": 0, "warn": 1}
     replica_findings = [(lvl, f"{cid}: {msg}") for cid, lvl, msg in
-                        sorted(status_triples + replica_triples, key=lambda t: rank.get(t[1], 2))]
+                        sorted(status_triples + replica_triples, key=lambda t: rank.get(t[1], 2)) if lvl != "info"]
     # Peers whose replicas no source (direct endpoint or /cluster/telemetry) reported.
     unmapped = sorted({p for mx in replicas_by_coll.values() for p in mx["unreachable"]})
     covered = {r["peer"] for mx in replicas_by_coll.values() for sh in mx["shards"] for r in sh["replicas"]
@@ -1711,17 +1721,16 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
             "transfers": len(c.get("transfers") or []),
             "hw": _d(hw.get(c.get("id"))),
             "replicas": replicas_by_coll.get(c.get("id")),
-            "cluster_points": _cluster_points(replicas_by_coll.get(c.get("id")), sum(l.get("num_points") or 0 for l in local)),
+            "cluster_points": _cluster_points(replicas_by_coll.get(c.get("id")),
+                                              info_by_coll.get(c.get("id"), {}).get("points_count"),
+                                              sum(l.get("num_points") or 0 for l in local)),
             "coll_status": info_by_coll.get(c.get("id"), {}).get("status"),
             "info_error": info_err_by_coll.get(c.get("id")),
             "indexed_vectors": info_by_coll.get(c.get("id"), {}).get("indexed_vectors_count"),
             "segments_count": info_by_coll.get(c.get("id"), {}).get("segments_count"),
             "vectors_total": _cluster_vectors(cltele, c.get("id")) or (sum(nbyname.values()) if nbyname else None),
-            "vec_names": [
-                {"name": n or "(default)", "size": _d(v).get("size"), "distance": _d(v).get("distance")}
-                for n, v in (({"": cfg_params.get("vectors")} if "size" in _d(cfg_params.get("vectors"))
-                              else _d(cfg_params.get("vectors"))).items())
-            ],
+            "vec_names": [{"name": n or "(default)", "size": v.get("size"), "distance": v.get("distance")}
+                          for n, v in insights.vector_configs(cfg_params).items()],
             "sparse_names": list(_d(cfg_params.get("sparse_vectors"))),
             "optimizer_error": insights.optimizer_error(info_by_coll.get(c.get("id"), {}).get("optimizer_status")),
             "optimizer_known": "optimizer_status" in info_by_coll.get(c.get("id"), {}),
@@ -1792,8 +1801,9 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
          (f"{len(live_rafts)}/{len(peers) or 1} checked, agree" if len(live_rafts) > 1 else "only this peer checked")
          if len(leaders) <= 1 and len(terms) <= 1
          else f"leaders {sorted(map(str, leaders))} · terms {sorted(map(str, terms))}"),
-        ("collections", not any(lvl == "error" for _, lvl, _ in status_triples),
+        ("collections", not any(lvl == "error" for _, lvl, _ in status_triples) and not info_err_by_coll,
          ", ".join(x for x in (
+             f"{len(info_err_by_coll)} unknown (info unavailable)",
              f"{len({cid for cid, lvl, m in status_triples if m.startswith('Collection status')})} not green",
              f"{sum(1 for _, _, m in status_triples if m.startswith('Optimizer error'))} optimizer error(s)",
          ) if not x.startswith("0 ")) or f"{len(coll_rows)} green"),
@@ -1806,6 +1816,7 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
          or "ok"),
     ]
 
+    unreachable = bool(e1 and e2 and ": HTTP " not in e1 and ": HTTP " not in e2)
     for row in coll_rows:
         mine = [lvl for cid, lvl, _ in status_triples + replica_triples if cid == row["name"]]
         row["errors"], row["warnings"] = mine.count("error"), mine.count("warn")
@@ -1813,6 +1824,7 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
     snap_list = snaps if isinstance(snaps, list) else []
     return {
         "conn": conn,
+        "unreachable": unreachable,
         "errors": errors,
         "health": health,
         "replica_findings": replica_findings,

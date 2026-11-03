@@ -275,7 +275,7 @@ document.getElementById('migrate-form')?.addEventListener('submit', async functi
           {% if c.info_error %}<div class="text-[0.6875rem] text-[#f87171]" title="{{ c.info_error }}">▲ info unavailable</div>{% endif %}</td>
         <td class="px-3 py-2 whitespace-nowrap">
           {% set cs = c.coll_status %}
-          <span class="badge {{ {'green': 'badge-green', 'yellow': 'badge-yellow', 'grey': 'badge-blue', 'red': 'badge-red'}.get(cs, '') }}"
+          <span class="badge {{ cs | status_badge }}"
                 title="{{ status_meaning.get(cs, '') }}">{{ '●' if cs == 'green' else '▲' }} {{ cs or 'unknown' }}</span>
           <div class="text-[0.6875rem] mt-1 {{ 'text-[#f87171]' if c.optimizer_error else 'text-[#94a8c8]' }}" {% if c.optimizer_error %}title="{{ c.optimizer_error }}"{% endif %}>
             optimizer {% if c.optimizer_error %}▲ error{% elif c.optimizer_known %}ok{% else %}—{% endif %}{% if c.running_opt %} · <span class="text-[#fbbf24]">{{ c.running_opt | int }} running</span>{% endif %}

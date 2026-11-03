@@ -90,7 +90,7 @@
           <div class="text-[0.6875rem] text-[#94a8c8]">{{ c.shards }} shard{{ 's' if c.shards != 1 }} × RF {{ c.replication }}</div></td>
         <td class="px-3 py-2 align-top">
           {% set cs = c.coll_status %}
-          <span class="badge {{ {'green': 'badge-green', 'yellow': 'badge-yellow', 'grey': 'badge-blue', 'red': 'badge-red'}.get(cs, '') }}"
+          <span class="badge {{ cs | status_badge }}"
                 title="{{ status_meaning.get(cs, '') }}">{{ '●' if cs == 'green' else '▲' }} {{ cs or 'unknown' }}</span>
           {% if c.optimizer_error %}<div class="text-[0.6875rem] text-[#f87171] mt-1" title="{{ c.optimizer_error }}">▲ optimizer error</div>{% endif %}
         </td>
@@ -104,7 +104,7 @@
               {% if v.replicas > 1 %}{{ v.active }}/{{ v.replicas }} Active{% else %}{{ v.worst_state or ('Active' if ok else ('disputed' if v.disagree else 'unverified')) }}{% endif %}
             </span>
             {% if v.status and v.status != 'green' %}
-            <span class="badge {{ 'badge-red' if v.status == 'red' else ('badge-yellow' if v.status == 'yellow' else 'badge-blue') }}" title="{{ status_meaning.get(v.status, '') }}">{{ v.status }}</span>
+            <span class="badge {{ v.status | status_badge }}" title="{{ status_meaning.get(v.status, '') }}">{{ v.status }}</span>
             {% endif %}
           </div>
           <div class="font-mono text-[#94a8c8] mt-1">{{ '{:,}'.format(v.points) if v.points_known else '— points' }}{% if v.replicas > 1 and v.worst_state %} <span class="text-[#f87171]">· {{ v.worst_state }}</span>{% endif %}{% if v.disagree %} <span class="text-[#f87171]">· disputed</span>{% endif %}</div>
@@ -393,7 +393,7 @@
         <td class="px-3 py-2"><a href="/collection/{{ c.name }}" class="font-mono text-[#38bdf8] hover:text-[#00e5a0]">{{ c.name }}</a></td>
         <td class="px-3 py-2">
           {% set cs = c.coll_status %}
-          <span class="badge {{ {'green': 'badge-green', 'yellow': 'badge-yellow', 'grey': 'badge-blue', 'red': 'badge-red'}.get(cs, '') }}"
+          <span class="badge {{ cs | status_badge }}"
                 title="{{ status_meaning.get(cs, '') }}">{{ '●' if cs == 'green' else '▲' }} {{ cs or 'unknown' }}</span>
         </td>
         <td class="px-3 py-2 whitespace-nowrap">
