@@ -1,0 +1,565 @@
+{% extends "base.html" %}
+{% block title %}Cluster — Qdrant Monitor{% endblock %}
+
+{% macro meter(pct, warn=70, bad=90) -%}
+<div class="meter {% if pct is number and pct >= bad %}meter-bad{% elif pct is number and pct >= warn %}meter-warn{% endif %}"
+     role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ (pct if pct is number else 0) | round(1) }}">
+  <span style="width: {{ [pct if pct is number else 0, 100] | min }}%"></span>
+</div>
+{%- endmacro %}
+
+{% block content %}
+<!-- ── Header ── -->
+<div class="flex items-end justify-between flex-wrap gap-4 mb-6">
+  <div>
+    <h1 class="font-display font-bold text-2xl text-white tracking-tight">Cluster</h1>
+    <p class="text-sm text-[#7b8fb5] mt-1">
+      Qdrant <span class="font-mono text-[#38bdf8]">{{ app_info.version or '?' }}</span>
+      &middot; <span class="font-mono text-xs">{{ conn.host }}:{{ conn.port }}</span>
+      &middot; {{ peers | length }} peer{{ 's' if peers | length != 1 else '' }}
+      {% if app_info.startup %}&middot; up <span id="uptime" class="font-mono" data-start="{{ app_info.startup }}">—</span>{% endif %}
+      {% if system.container_runtime %}&middot; {{ system.container_runtime }}{% endif %}
+    </p>
+  </div>
+  <a href="/cluster" class="qd-btn-ghost text-xs py-2 px-3">Refresh snapshot</a>
+</div>
+
+{% if msg %}
+<div class="qd-card p-3 mb-4 text-xs text-[#d0dce8]" role="status">{{ msg }}</div>
+{% endif %}
+{% if errors %}
+<div class="qd-card p-4 mb-6 border-[rgba(239,68,68,0.4)]">
+  <p class="text-xs text-[#f87171] font-semibold mb-1">Some endpoints did not answer; the panels below that depend on them are incomplete.</p>
+  <ul class="text-xs font-mono text-[#f87171] space-y-0.5">{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+<!-- ── Health strip ── -->
+<section class="mb-8" aria-label="Health checks">
+  <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 xl:grid-cols-5 gap-3">
+    {% for label, ok, detail in health %}
+    <div class="health-cell {% if not ok %}is-bad{% endif %}">
+      <div class="flex items-center gap-2 text-[0.6875rem] uppercase tracking-wider {% if ok %}text-[#4ade80]{% else %}text-[#f87171]{% endif %}">
+        <span aria-hidden="true">{% if ok %}●{% else %}▲{% endif %}</span>
+        {{ label }}
+        <span class="sr-only">{{ 'ok' if ok else 'problem' }}</span>
+      </div>
+      <div class="font-mono text-xs text-[#d0dce8] mt-1 truncate" title="{{ detail }}">{{ detail }}</div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+{% if replica_findings %}
+<section class="qd-card p-5 mb-8 border-[rgba(239,68,68,0.35)]">
+  <h2 class="hud-title">Replica findings <span class="hud-sub">from every reachable peer's own view{% if unmapped %} · {{ unmapped | length }} peer(s) not mapped{% endif %}</span></h2>
+  <ul class="space-y-2 text-xs">
+    {% for level, m in replica_findings %}
+    <li class="flex items-start gap-3">
+      {% if level == 'error' %}<span class="badge badge-red shrink-0 min-w-[4.75rem] justify-center whitespace-nowrap">▲ error</span>
+      {% else %}<span class="badge badge-yellow shrink-0 min-w-[4.75rem] justify-center whitespace-nowrap">▲ warn</span>{% endif %}
+      <span class="text-[#d0dce8] leading-5">{{ m }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% elif unmapped %}
+<div class="qd-card p-4 mb-8 text-xs text-[#fbbf24]">▲ {{ unmapped | length }} peer(s) have no reachable endpoint, so their replicas are unverified. <a href="#peer-endpoints" class="underline">Map endpoints</a>.</div>
+{% endif %}
+
+<!-- ── Resources + Memory ── -->
+<div class="grid grid-cols-1 xl:grid-cols-2 gap-5 mb-8">
+  <section class="qd-card p-5">
+    <h2 class="hud-title">Resources <span class="hud-sub">{{ 'host machine limits (Qdrant < 1.19)' if host_limits else 'container (cgroup) limits from telemetry' }}</span></h2>
+    {% if host_limits %}
+    <p class="text-[0.6875rem] text-[#fbbf24] -mt-2 mb-3">▲ Qdrant {{ app_info.version }} reports the machine's RAM and cores, not the pod's limits. Percentages below are against the host; check the container limit (for example <span class="font-mono">kubectl get pod … -o jsonpath='{.spec.containers[*].resources}'</span>). Fixed in Qdrant 1.19.</p>
+    {% endif %}
+    {% set res = memory.resident_bytes %}
+    {% set ram_pct = (res / ram_total * 100) if res and ram_total else none %}
+    {% set disk_pct = quotas.usage.disk_usage_percent if quotas.usage and quotas.usage.disk_usage_percent is number else none %}
+    <div class="space-y-4">
+      <div>
+        <div class="flex justify-between text-xs mb-1.5">
+          <span>RAM resident (Qdrant heap)</span>
+          <span class="font-mono text-[#d0dce8]">{{ res | bytes }} / {{ ram_total | bytes }}{% if host_limits %} host{% endif %}{% if ram_pct is not none %} · {{ ram_pct | round(1) }}%{% endif %}</span>
+        </div>
+        {{ meter(ram_pct) }}
+        {% if quotas.usage and quotas.usage.resident_memory_percent is number %}
+        <p class="text-[0.6875rem] text-[#7b8fb5] mt-1">Quota API reports {{ quotas.usage.resident_memory_percent }}% resident memory (includes page cache Qdrant owns).</p>
+        {% endif %}
+      </div>
+      <div>
+        <div class="flex justify-between text-xs mb-1.5">
+          <span>Disk</span>
+          <span class="font-mono text-[#d0dce8]">{{ disk_total | bytes }} total{% if disk_pct is not none %} · {{ disk_pct }}% used{% endif %}</span>
+        </div>
+        {{ meter(disk_pct, 75, 90) }}
+      </div>
+      <div>
+        <div class="flex justify-between text-xs mb-1.5">
+          <span>CPU</span>
+          <span class="font-mono text-[#d0dce8]">{{ '%.3f' | format(system.cpu_cores_used or 0) }} / {{ system.cores or '?' }} {{ 'host ' if host_limits }}cores</span>
+        </div>
+        {{ meter(((system.cpu_cores_used or 0) / system.cores * 100) if system.cores else none) }}
+      </div>
+      {% for label, r in [('File descriptors', fds), ('Memory maps', mmaps)] %}
+      <div>
+        <div class="flex justify-between text-xs mb-1.5">
+          <span>{{ label }}</span>
+          <span class="font-mono text-[#d0dce8]">{{ '{:,.0f}'.format(r[0]) if r[0] is not none else '—' }} / {{ '{:,.0f}'.format(r[1]) if r[1] is not none else '—' }}{% if r[2] is not none %} · {{ '%.2f' | format(r[2]) }}%{% endif %}</span>
+        </div>
+        {{ meter(r[2]) }}
+      </div>
+      {% endfor %}
+      <dl class="kv pt-3 border-t border-[#1a2236]">
+        <dt>Quotas</dt>
+        <dd>{% if quotas.config and quotas.config.enabled %}enabled · mem {{ quotas.config.max_resident_memory_percent or '∞' }}% · disk {{ quotas.config.max_disk_usage_percent or '∞' }}%{% else %}disabled{% endif %}</dd>
+        <dt>Search pool</dt>
+        <dd>{{ search_pool.mode or '—' }} · cpu {{ search_pool.high_cpu_threads or '?' }} · io {{ search_pool.high_io_threads or '?' }} threads</dd>
+        <dt>Low memory mode</dt>
+        <dd>{{ app_info.low_memory_mode or '—' }}</dd>
+      </dl>
+    </div>
+  </section>
+
+  <section class="qd-card p-5">
+    <h2 class="hud-title">Memory <span class="hud-sub">allocator + memory tiers</span></h2>
+    <dl class="kv mb-5">
+      <dt>Allocated (live objects)</dt><dd>{{ memory.allocated_bytes | bytes }}</dd>
+      <dt>Active pages</dt><dd>{{ memory.active_bytes | bytes }}</dd>
+      <dt>Resident</dt><dd>{{ memory.resident_bytes | bytes }}</dd>
+      <dt>Retained (freed, not returned to OS)</dt><dd>{{ memory.retained_bytes | bytes }}</dd>
+      <dt>Allocator metadata</dt><dd>{{ memory.metadata_bytes | bytes }}</dd>
+      {% if memory.resident_bytes and memory.allocated_bytes %}
+      <dt>Fragmentation (resident / allocated)</dt>
+      <dd>{{ '%.2f' | format(memory.resident_bytes / memory.allocated_bytes) }}×</dd>
+      {% endif %}
+    </dl>
+
+    {% set mt = mem_totals %}
+    <div class="pt-4 border-t border-[#1a2236]">
+      <div class="flex items-center justify-between text-xs mb-3">
+        <span>Collection data <span class="text-[#7b8fb5]">· measured by /collections/{name}/memory</span></span>
+        <span class="font-mono text-[#d0dce8]">{{ mt.disk_bytes | bytes }} on disk</span>
+      </div>
+      {% if mem_available %}
+      {% set budget = mt.ram_bytes + mt.expected_cache_bytes %}
+      {% set budget_pct = (budget / ram_total * 100) if ram_total else none %}
+      {% set warm = (mt.warm_cached_bytes / mt.expected_cache_bytes * 100) if mt.expected_cache_bytes else none %}
+      <div class="space-y-3 text-xs">
+        <div>
+          <div class="flex justify-between mb-1.5">
+            <span><span class="tier tier-pinned mr-2">heap</span>non-evictable RAM</span>
+            <span class="font-mono text-[#d0dce8]">{{ mt.ram_bytes | bytes }}</span>
+          </div>
+        </div>
+        <div>
+          <div class="flex justify-between mb-1.5">
+            <span><span class="tier tier-cached mr-2">cache</span>page cache · warm vs expected</span>
+            <span class="font-mono text-[#d0dce8]">{{ mt.cached_bytes | bytes }} / {{ mt.expected_cache_bytes | bytes }}{% if warm is not none %} · {{ [warm, 100] | min | round(0) | int }}%{% endif %}</span>
+          </div>
+          {{ meter([warm, 100] | min if warm is not none else none, 101, 101) }}
+        </div>
+        <div>
+          <div class="flex justify-between mb-1.5">
+            <span>RAM budget · heap + expected cache vs {{ 'host' if host_limits else 'container' }} RAM</span>
+            <span class="font-mono text-[#d0dce8]">{{ budget | bytes }} / {{ ram_total | bytes }}{% if host_limits %} host{% endif %}{% if budget_pct is not none %} · {{ budget_pct | round(1) }}%{% endif %}</span>
+          </div>
+          {{ meter(budget_pct, 70, 90) }}
+          <p class="text-[0.6875rem] text-[#7b8fb5] mt-1">
+            {% if host_limits %}▲ Compared with host RAM; compare {{ budget | bytes }} with the pod's memory limit instead.
+            {% elif budget_pct is none %}Node RAM unknown.
+            {% elif budget_pct < 70 %}● The full working set fits in RAM with headroom.
+            {% elif budget_pct < 100 %}▲ Working set is close to node RAM; page cache evictions will start under load.
+            {% else %}▲ Working set exceeds node RAM; cached tiers will be evicted and read from disk.{% endif %}
+          </p>
+        </div>
+      </div>
+      {% else %}
+      {% if not mem_supported %}
+      <p class="text-xs text-[#7b8fb5]">Per-component memory needs Qdrant 1.18+ (<span class="font-mono">GET /collections/{name}/memory</span>); this server is {{ app_info.version }}.</p>
+      {% elif mem_errors %}
+      <p class="text-xs text-[#fbbf24]">▲ <span class="font-mono">/collections/{name}/memory</span> failed, often because a collection is still loading after a restart. Refresh in a moment.</p>
+      <ul class="text-[0.6875rem] font-mono text-[#f87171] mt-1">{% for e in mem_errors %}<li>{{ e }}</li>{% endfor %}</ul>
+      {% else %}
+      <p class="text-xs text-[#7b8fb5]">No collections on this peer.</p>
+      {% endif %}
+      {% endif %}
+      <div class="flex flex-wrap gap-x-4 gap-y-1 text-[0.6875rem] text-[#7b8fb5] mt-4">
+        <span><span class="tier tier-pinned mr-1">pinned</span> heap, never evicted</span>
+        <span><span class="tier tier-cached mr-1">cached</span> mmap, pre-warmed, OS may evict</span>
+        <span><span class="tier tier-cold mr-1">cold</span> mmap, read on first access</span>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- ── Live ── -->
+<section class="qd-card p-5 mb-8">
+  <div class="flex items-center justify-between flex-wrap gap-3">
+    <h2 class="hud-title mb-0">Live <span class="hud-sub">sampled from /metrics every 5 s while this page is open</span></h2>
+    <div class="flex items-center gap-3 text-xs">
+      <span id="live-status" class="font-mono text-[#7b8fb5]">waiting for 2nd sample…</span>
+      <button id="live-toggle" class="qd-btn-ghost text-xs py-1 px-3" onclick="toggleLive()">Pause</button>
+    </div>
+  </div>
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mt-4">
+    <figure><div id="chart-mem" class="h-44"></div><figcaption id="cap-mem" class="text-[0.6875rem] text-[#7b8fb5] mt-1"></figcaption></figure>
+    <figure><div id="chart-req" class="h-44"></div><figcaption id="cap-req" class="text-[0.6875rem] text-[#7b8fb5] mt-1"></figcaption></figure>
+    <figure><div id="chart-faults" class="h-44"></div><figcaption id="cap-faults" class="text-[0.6875rem] text-[#7b8fb5] mt-1"></figcaption></figure>
+  </div>
+</section>
+
+<!-- ── Consensus & peers ── -->
+<section class="qd-card p-5 mb-8">
+  <h2 class="hud-title">Consensus &amp; peers <span class="hud-sub">{{ 'distributed mode' if cluster.status == 'enabled' else 'single node (cluster disabled)' }}</span></h2>
+  <dl class="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-3 mb-5 text-xs">
+    {% for label, value, accent in [
+        ('Leader', (raft.leader | string) ~ (' (this)' if leader_id and leader_id == self_id else ''), true),
+        ('This peer', self_id or '—', false),
+        ('Role', raft.role or '—', false),
+        ('Term', raft.term if raft.term is not none else '—', false),
+        ('Commit', raft.commit if raft.commit is not none else '—', false),
+        ('Pending ops', raft.pending_operations if raft.pending_operations is not none else '—', false),
+        ('Consensus thread', (cluster.consensus_thread_status or {}).consensus_thread_status or '—', false),
+        ('Last tick', ((cluster.consensus_thread_status or {}).last_update or '—')[11:19], false)] %}
+    <div class="health-cell">
+      <dt class="text-[0.6875rem] uppercase tracking-wider text-[#7b8fb5]">{{ label }}</dt>
+      <dd class="font-mono mt-1 truncate {{ 'text-[#f0abfc]' if accent else 'text-[#d0dce8]' }}" title="{{ value }}">{% if accent %}◆ {% endif %}{{ value }}</dd>
+    </div>
+    {% endfor %}
+  </dl>
+  <div>
+    <div class="overflow-x-auto">
+      <table class="qd-table w-full text-xs">
+        <thead><tr>
+          <th class="text-left px-3 py-2">Peer</th><th class="text-left px-3 py-2">Endpoint</th>
+          <th class="text-left px-3 py-2">Own view</th><th class="text-left px-3 py-2">Version</th>
+          <th class="text-left px-3 py-2">Consensus</th><th class="text-right px-3 py-2">RAM</th>
+          <th class="text-right px-3 py-2">Collections</th><th class="text-right px-3 py-2">Send failures</th>
+        </tr></thead>
+        <tbody>
+        {% for p in peers %}
+        {% set lr = p.live_raft %}
+        {% set raft_off = lr and (lr.leader != raft.leader or lr.term != raft.term) %}
+        <tr>
+          <td class="px-3 py-2 whitespace-nowrap">
+            <span class="font-mono text-[#38bdf8]">{{ p.id }}</span>{% if p.is_self %} <span class="badge badge-blue ml-1">this</span>{% endif %}
+            {% if p.id | string == leader_id %}<span class="badge ml-1 text-[#f0abfc] border border-[rgba(240,171,252,0.3)] bg-[rgba(240,171,252,0.08)]">◆ leader</span>{% endif %}
+            <div class="text-[0.6875rem] font-mono text-[#7b8fb5] max-w-[16rem] truncate" title="{{ p.uri }}">{{ p.uri }}</div>
+          </td>
+          <td class="px-3 py-2 font-mono whitespace-nowrap">
+            {% if p.endpoint %}
+              {% if p.live_error %}<span class="text-[#f87171]" title="{{ p.live_error }}">▲ {{ p.endpoint }}</span>
+              {% else %}<span class="text-[#4ade80]">● {{ p.endpoint | replace('http://', '') }}</span>{% endif %}
+            {% else %}<a href="#peer-endpoints" class="text-[#fbbf24] hover:text-[#00e5a0]">▲ not mapped</a>{% endif %}
+          </td>
+          <td class="px-3 py-2 font-mono whitespace-nowrap {% if raft_off %}text-[#f87171]{% endif %}">
+            {% if lr %}{{ lr.role }} · leader …{{ (lr.leader | string)[-4:] }} · t{{ lr.term }} · c{{ lr.commit }}{% if lr.pending_operations %} · {{ lr.pending_operations }} pending{% endif %}{% if raft_off %} ▲{% endif %}
+            {% else %}<span class="text-[#7b8fb5]">{{ p.role or '—' }}</span>{% endif %}
+          </td>
+          <td class="px-3 py-2 font-mono">{{ p.version or '—' }}</td>
+          <td class="px-3 py-2">
+            {% if p.responsive is sameas true %}<span class="badge badge-green">● responsive</span>
+            {% elif p.responsive is sameas false %}<span class="badge badge-red">▲ unresponsive</span>
+            {% else %}—{% endif %}
+          </td>
+          <td class="px-3 py-2 text-right font-mono whitespace-nowrap">
+            {% if p.resident is not none %}{{ p.resident | bytes }}{% if p.ram_total %} <span class="text-[#7b8fb5]">/ {{ p.ram_total | bytes }}</span>{% endif %}
+            {% elif p.quota.resident_memory_percent is number %}{{ p.quota.resident_memory_percent }}%{% else %}—{% endif %}
+          </td>
+          <td class="px-3 py-2 text-right font-mono">{{ p.collections | int if p.collections is not none else '—' }}</td>
+          <td class="px-3 py-2 text-right font-mono {% if p.send_failures %}text-[#f87171]{% endif %}">
+            {% if p.send_failures %}{{ p.send_failures.count }} · {{ p.send_failures.latest_error | trunc(40) }}{% else %}0{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="peer-endpoints" class="mt-5 pt-4 border-t border-[#1a2236]">
+    <div class="flex items-start justify-between flex-wrap gap-4">
+      <div class="max-w-xl">
+        <h3 class="text-xs uppercase tracking-wider text-[#d0dce8] mb-1">Peer endpoints</h3>
+        <p class="text-[0.6875rem] text-[#7b8fb5]">
+          Peer URIs above are cluster-internal. Give this app a URL it can reach for each peer (for example a
+          <span class="font-mono">kubectl port-forward</span>) so every replica's own state and point count can be read.
+          Each URL is checked with <span class="font-mono">GET /cluster</span> and kept only if it belongs to this cluster.
+        </p>
+      </div>
+      <form action="/api/peers/discover" method="post">
+        <button type="submit" class="qd-btn text-xs py-1.5 px-3">Scan {{ conn.host }}:{{ conn.port - 20 }}–{{ conn.port + 20 }}</button>
+      </form>
+    </div>
+    <form action="/api/peers/save" method="post" class="flex items-end gap-2 mt-3">
+      <div class="flex-1">
+        <label for="peer-urls" class="block text-[0.6875rem] text-[#7b8fb5] uppercase tracking-wider mb-1.5">Endpoint URLs, one per line</label>
+        <textarea id="peer-urls" name="urls" rows="{{ [peers | length, 2] | max }}" class="qd-input text-xs font-mono w-full"
+                  placeholder="localhost:16351&#10;localhost:16352">{% for p in peers if p.endpoint and not p.is_self %}{{ p.endpoint }}
+{% endfor %}</textarea>
+      </div>
+      <button type="submit" class="qd-btn-ghost text-xs py-1.5 px-3">Save endpoints</button>
+    </form>
+  </div>
+  {% if issues %}
+  <div class="mt-5 pt-4 border-t border-[#1a2236]">
+    <h3 class="text-xs uppercase tracking-wider text-[#fbbf24] mb-2">▲ Issues reported by Qdrant</h3>
+    <ul class="space-y-2 text-xs">
+      {% for i in issues %}
+      <li class="font-mono"><span class="text-[#fbbf24]">{{ i.id }}</span> — {{ i.description }}{% if i.solution %}<div class="text-[#7b8fb5]">fix: {{ i.solution | trunc(300) }}</div>{% endif %}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+</section>
+
+<!-- ── Collections ── -->
+<section class="qd-card p-5 mb-8">
+  <h2 class="hud-title">Collections <span class="hud-sub">storage footprint, tiers and IO counters since start</span></h2>
+  {% if not collections %}
+  <p class="text-sm text-[#7b8fb5]">No collections on this node. Create one from the <a href="/" class="text-[#00e5a0]">Collections page</a>.</p>
+  {% else %}
+  <div class="overflow-x-auto">
+    <table class="qd-table w-full text-xs">
+      <thead><tr>
+        <th class="text-left px-3 py-2">Collection</th><th class="text-right px-3 py-2">Points</th>
+        <th class="text-left px-3 py-2">Shards × RF</th><th class="text-left px-3 py-2">Replicas</th>
+        <th class="text-right px-3 py-2">Disk</th><th class="text-right px-3 py-2">Heap</th>
+        <th class="text-right px-3 py-2">Cache warm</th>
+        <th class="text-left px-3 py-2">Tiers</th><th class="text-right px-3 py-2">Optimizing</th>
+        <th class="text-right px-3 py-2">CPU</th><th class="text-right px-3 py-2">IO read / write</th>
+      </tr></thead>
+      <tbody>
+      {% for c in collections %}
+      <tr>
+        <td class="px-3 py-2"><a href="/collection/{{ c.name }}" class="font-mono text-[#38bdf8] hover:text-[#00e5a0]">{{ c.name }}</a></td>
+        {% set mx = c.replicas %}
+        {% set cluster_points = (mx.shards | map(attribute='max_points') | select('number') | sum) if mx and mx.shards else none %}
+        <td class="px-3 py-2 text-right font-mono" title="{{ '{:,}'.format(c.points) }} on this peer">
+          {{ '{:,}'.format(cluster_points if cluster_points is not none else c.points) }}
+          {% if cluster_points is not none and cluster_points != c.points %}<div class="text-[0.6875rem] text-[#fbbf24]">▲ {{ '{:,}'.format(c.points) }} here</div>{% endif %}
+        </td>
+        <td class="px-3 py-2 font-mono">{{ c.shards }} × {{ c.replication }}{% if c.transfers %} <span class="badge badge-yellow">{{ c.transfers }} transfer</span>{% endif %}</td>
+        <td class="px-3 py-2 whitespace-nowrap">
+          {% if mx and mx.shards %}
+          {% set errs = mx.findings | selectattr('0', 'equalto', 'error') | list %}
+          {% set readable = mx.shards | sum(attribute='readable') %}
+          {% set total = mx.shards | sum(attribute='total') %}
+          <span class="badge {{ 'badge-red' if errs else 'badge-green' }}">{{ '▲' if errs else '●' }} {{ readable }}/{{ total }} readable</span>
+          {% if errs %}<a href="/collection/{{ c.name }}" class="block text-[0.6875rem] text-[#f87171] mt-1 hover:underline">{{ errs | length }} replica issue{{ 's' if errs | length != 1 }} →</a>{% endif %}
+          {% if mx.unreachable %}<div class="text-[0.6875rem] text-[#7b8fb5] mt-1">{{ mx.unreachable | length }} unverified</div>{% endif %}
+          {% else %}
+          {% for s in c.states %}<span class="badge {{ 'badge-green' if s == 'Active' else 'badge-red' }} mr-1">{{ s }}</span>{% else %}—{% endfor %}
+          {% endif %}
+        </td>
+        {% if c.usage %}
+        <td class="px-3 py-2 text-right font-mono">{{ c.usage.disk_bytes | bytes }}</td>
+        <td class="px-3 py-2 text-right font-mono">{{ c.usage.ram_bytes | bytes }}</td>
+        <td class="px-3 py-2 text-right font-mono {% if c.usage.warm_pct is not none and c.usage.warm_pct < 80 %}text-[#fbbf24]{% endif %}"
+            title="{{ c.usage.cached_bytes | bytes }} cached of {{ c.usage.expected_cache_bytes | bytes }} expected">
+          {{ '%.0f%%' | format(c.usage.warm_pct) if c.usage.warm_pct is number else '—' }}{% if c.usage.warm_pct is not none and c.usage.warm_pct < 80 %} ▲{% endif %}
+        </td>
+        {% else %}
+        <td class="px-3 py-2 text-right font-mono">{{ (c.vectors_bytes + c.payload_bytes) | bytes }}</td>
+        <td class="px-3 py-2 text-right">—</td><td class="px-3 py-2 text-right">—</td>
+        {% endif %}
+        <td class="px-3 py-2">
+          <div class="flex flex-wrap gap-1">
+          {% for t in c.tiers %}<span class="tier tier-{{ t.tier }}" title="{{ t.component }} · {{ t.source }}">{{ t.component.split(' · ')[0] }}: {{ t.tier }}</span>{% endfor %}
+          </div>
+        </td>
+        <td class="px-3 py-2 text-right font-mono">{{ c.running_opt | int if c.running_opt is not none else '—' }}</td>
+        <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(c.hw.cpu) if c.hw.cpu is number else '—' }}</td>
+        <td class="px-3 py-2 text-right font-mono whitespace-nowrap"
+            title="vectors {{ c.hw.vector_io_read | bytes }} / {{ c.hw.vector_io_write | bytes }} · payload {{ c.hw.payload_io_read | bytes }} / {{ c.hw.payload_io_write | bytes }} · payload index {{ c.hw.payload_index_io_read | bytes }} / {{ c.hw.payload_index_io_write | bytes }}">
+          {{ ((c.hw.vector_io_read or 0) + (c.hw.payload_io_read or 0) + (c.hw.payload_index_io_read or 0)) | bytes }}
+          / {{ ((c.hw.vector_io_write or 0) + (c.hw.payload_io_write or 0) + (c.hw.payload_index_io_write or 0)) | bytes }}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="text-[0.6875rem] text-[#7b8fb5] mt-2">CPU and IO are Qdrant's hardware counters since startup (CPU in abstract units). Hover IO for the vectors / payload / payload-index split. Cache warm = page cache ÷ expected cache.</p>
+  {% endif %}
+</section>
+
+<!-- ── Latency ── -->
+<section class="qd-card p-5 mb-8">
+  <h2 class="hud-title">API latency <span class="hud-sub">per endpoint since startup · top 30 by volume</span></h2>
+  {% if not latency %}
+  <p class="text-sm text-[#7b8fb5]">No requests recorded yet.</p>
+  {% else %}
+  <div class="overflow-x-auto">
+    <table class="qd-table w-full text-xs">
+      <thead><tr>
+        <th class="text-left px-3 py-2">API</th><th class="text-left px-3 py-2">Endpoint</th>
+        <th class="text-left px-3 py-2">Status</th><th class="text-right px-3 py-2">Count</th>
+        <th class="text-right px-3 py-2">Avg</th><th class="text-right px-3 py-2">p95 (est.)</th>
+        <th class="text-right px-3 py-2">Max</th>
+      </tr></thead>
+      <tbody>
+      {% for r in latency %}
+      <tr>
+        <td class="px-3 py-2 font-mono text-[#7b8fb5]">{{ r.proto }}{% if r.method %} {{ r.method }}{% endif %}</td>
+        <td class="px-3 py-2 font-mono text-[#d0dce8] break-all">{{ r.endpoint }}</td>
+        <td class="px-3 py-2"><span class="badge {{ 'badge-red' if r.failed else 'badge-green' }}">{{ '▲ ' if r.failed }}{{ r.status }}</span></td>
+        <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(r.count) }}</td>
+        {% for v in [r.avg, r.p95, r.max] %}
+        <td class="px-3 py-2 text-right font-mono">{% if v is not none %}{% if v < 1 %}{{ '%.2f' | format(v * 1000) }} ms{% else %}{{ '%.2f' | format(v) }} s{% endif %}{% else %}—{% endif %}</td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="text-[0.6875rem] text-[#7b8fb5] mt-2">p95 is interpolated from Prometheus histogram buckets, so it is only as precise as the bucket edges.</p>
+  {% endif %}
+</section>
+
+<!-- ── Slow requests ── -->
+<section class="qd-card p-5 mb-8">
+  <h2 class="hud-title">Slow requests <span class="hud-sub">shard operations over 50 ms since startup · this peer · slowest first</span></h2>
+  {% if not slow_requests %}
+  <p class="text-sm text-[#7b8fb5]">● No request took longer than 50 ms since startup.</p>
+  {% else %}
+  {% include "partials/slow_requests.html" %}
+  {% endif %}
+</section>
+
+<!-- ── Node details ── -->
+<section class="qd-card p-5 mb-8">
+  <h2 class="hud-title">Node <span class="hud-sub">build, features and storage-level snapshots</span></h2>
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 text-xs">
+    <dl class="kv">
+      <dt>OS</dt><dd>{{ system.distribution or '—' }} {{ system.distribution_version or '' }}</dd>
+      <dt>Started</dt><dd>{{ app_info.startup or '—' }}</dd>
+      <dt>GPU</dt><dd>{{ (app_info.features or {}).gpu }}</dd>
+      <dt>HNSW healing threshold</dt><dd>{{ (app_info.hnsw_global_config or {}).healing_threshold or '—' }}</dd>
+      <dt>gRPC timeout</dt><dd>{{ cluster_cfg.grpc_timeout_ms or '—' }} ms</dd>
+      <dt>Raft tick</dt><dd>{{ (cluster_cfg.consensus or {}).tick_period_ms or '—' }} ms</dd>
+      <dt>CPU flags</dt><dd>{{ system.cpu_flags or '—' }}</dd>
+    </dl>
+    <div>
+      <div class="text-[#7b8fb5] mb-2">Runtime features</div>
+      <div class="flex flex-wrap gap-1.5">
+        {% for k, v in (app_info.runtime_features or {}).items() if k != 'all' %}
+        <span class="badge {{ 'badge-green' if v else '' }} {{ '' if v else 'text-[#7b8fb5] border border-[#1a2236]' }}">{{ '● ' if v else '○ ' }}{{ k }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    <div>
+      <div class="text-[#7b8fb5] mb-2">Full-storage snapshots · {{ full_snapshots | length }} · {{ full_snapshots_bytes | bytes }}</div>
+      {% if full_snapshots %}
+      <ul class="space-y-1 font-mono">
+        {% for s in full_snapshots %}<li class="flex justify-between gap-3"><span class="truncate text-[#38bdf8]" title="{{ s.name }}">{{ s.name }}</span><span>{{ s.size | bytes }}</span></li>{% endfor %}
+      </ul>
+      {% else %}<p class="text-[#7b8fb5]">None. Collection snapshots live on each collection's Snapshots tab.</p>{% endif %}
+    </div>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const up = document.getElementById('uptime');
+  if (up) {
+    const s = (Date.now() - Date.parse(up.dataset.start)) / 1000;
+    const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+    up.textContent = (d ? d + 'd ' : '') + h + 'h ' + m + 'm';
+  }
+})();
+
+const MAX = 120;
+const samples = [];
+let timer = null;
+const layout = (title, unit) => ({
+  title: {text: title, font: {family: 'Syne', size: 12, color: '#d0dce8'}, x: 0, xanchor: 'left'},
+  paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+  margin: {l: 48, r: 8, t: 28, b: 24},
+  font: {family: 'Fira Code', size: 10, color: '#7b8fb5'},
+  xaxis: {gridcolor: '#1a2236', zeroline: false, type: 'date'},
+  yaxis: {gridcolor: '#1a2236', zeroline: false, rangemode: 'tozero', ticksuffix: unit},
+  showlegend: true, legend: {orientation: 'h', y: -0.25, font: {size: 10}},
+});
+const cfg = {displayModeBar: false, responsive: true};
+const line = (color, name, y, x, dash) => ({x, y, name, type: 'scatter', mode: 'lines',
+  line: {color, width: 2, shape: 'spline', dash}, fill: dash ? 'none' : 'tozeroy',
+  fillcolor: color.replace(')', ',0.08)').replace('rgb', 'rgba')});
+
+function rates(key) {
+  const out = [];
+  for (let i = 1; i < samples.length; i++) {
+    const a = samples[i - 1], b = samples[i];
+    if (a[key] == null || b[key] == null) { out.push(null); continue; }
+    out.push(Math.max(0, (b[key] - a[key]) / (b.ts - a.ts)));
+  }
+  return out;
+}
+
+function draw() {
+  const x = samples.map(s => new Date(s.ts * 1000));
+  const xr = x.slice(1);
+  const mib = v => v == null ? null : v / 1048576;
+  Plotly.react('chart-mem', [
+    line('rgb(0,229,160)', 'resident', samples.map(s => mib(s.resident_bytes)), x),
+    line('rgb(56,189,248)', 'allocated', samples.map(s => mib(s.allocated_bytes)), x, 'dot'),
+  ], layout('Memory', ' MiB'), cfg);
+  const req = rates('requests_total'), fail = rates('failures_total');
+  Plotly.react('chart-req', [
+    line('rgb(56,189,248)', 'req/s', req, xr),
+    line('rgb(248,113,113)', 'failed/s', fail, xr, 'dot'),
+  ], layout('Requests', '/s'), cfg);
+  const maj = rates('major_faults_total');
+  Plotly.react('chart-faults', [line('rgb(165,180,252)', 'major faults/s', maj, xr)],
+    layout('Disk reads via page faults', '/s'), cfg);
+
+  const last = arr => arr.length ? arr[arr.length - 1] : null;
+  const fmt = v => v == null ? '—' : v.toFixed(v < 10 ? 2 : 0);
+  const cur = samples[samples.length - 1];
+  document.getElementById('cap-mem').textContent =
+    `Resident now ${fmt(mib(cur.resident_bytes))} MiB. Allocator heap only; page cache for mmapped data is not included.`;
+  document.getElementById('cap-req').textContent =
+    `${fmt(last(req))} req/s, ${fmt(last(fail))} failed/s over the last interval (REST + gRPC).`;
+  document.getElementById('cap-faults').textContent =
+    `${fmt(last(maj))} major faults/s. Sustained high values mean cold or evicted data is being read from disk.`;
+  document.getElementById('live-status').textContent =
+    `${samples.length} samples · last ${new Date(cur.ts * 1000).toLocaleTimeString()}`;
+}
+
+const FAST_MS = 5000, SLOW_MS = 30000;
+let failures = 0, failingSince = null, running = false, gen = 0;
+
+async function tick(g) {
+  let delay = FAST_MS;
+  try {
+    const r = await fetch('/api/cluster/sample');
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    failures = 0; failingSince = null;
+    samples.push(j);
+    if (samples.length > MAX) samples.shift();
+    if (samples.length >= 2) draw();
+  } catch (e) {
+    failures += 1;
+    failingSince = failingSince || new Date();
+    if (failures >= 3) delay = SLOW_MS;
+    document.getElementById('live-status').textContent =
+      `▲ Qdrant unreachable since ${failingSince.toLocaleTimeString()} (${failures} failed) · ` +
+      `retrying every ${delay / 1000} s · ${e.message}`;
+  }
+  // A pause/resume during an in-flight fetch bumps gen, so the stale loop stops here.
+  if (running && g === gen) timer = setTimeout(() => tick(g), delay);
+}
+
+function toggleLive() {
+  const btn = document.getElementById('live-toggle');
+  if (running) { running = false; clearTimeout(timer); timer = null; btn.textContent = 'Resume'; }
+  else { running = true; gen += 1; tick(gen); btn.textContent = 'Pause'; }
+}
+toggleLive();
+</script>
+{% endblock %}

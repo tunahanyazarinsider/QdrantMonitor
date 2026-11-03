@@ -146,6 +146,8 @@
           onclick="switchTab('vectorspace')">Vector Space</button>
   <button class="qd-tab" id="tab-btn-snapshots"
           onclick="switchTab('snapshots')">Snapshots</button>
+  <button class="qd-tab" id="tab-btn-health"
+          onclick="switchTab('health')">Health</button>
 </div>
 
 <!-- ── Tab: Browse ── -->
@@ -373,59 +375,29 @@
     </p>
   </div>
 
-  <!-- Restore section -->
-  <details class="qd-card p-3 mb-4">
-    <summary class="cursor-pointer text-xs text-[#00e5a0] uppercase tracking-wider">
-      Restore into "{{ collection.name }}"
-    </summary>
-    <div class="mt-3 grid gap-4 md:grid-cols-2">
-      <div>
-        <p class="text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-2">Upload .snapshot</p>
-        <form hx-post="/api/{{ collection.name }}/snapshots/upload-restore"
-              hx-target="#restore-result"
-              hx-swap="innerHTML"
-              hx-encoding="multipart/form-data"
-              hx-indicator="#snap-upload-spinner"
-              class="flex flex-wrap items-center gap-2">
-          <input type="file" name="snapshot_file" required
-                 class="text-xs text-[#7b8fb5] file:qd-btn-ghost file:text-xs file:py-1 file:px-2 file:mr-2 file:bg-transparent">
-          <select name="priority" class="qd-select text-xs py-1.5">
-            <option value="snapshot" selected>priority: snapshot</option>
-            <option value="replica">priority: replica</option>
-            <option value="no_sync">priority: no_sync</option>
-          </select>
-          <button type="submit" class="qd-btn text-xs py-1.5">Upload &amp; Restore</button>
-          <div id="snap-upload-spinner" class="htmx-indicator"><div class="qd-spinner"></div></div>
-        </form>
-      </div>
-      <div>
-        <p class="text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-2">Recover from URL</p>
-        <form hx-post="/api/{{ collection.name }}/snapshots/recover-url"
-              hx-target="#restore-result"
-              hx-swap="innerHTML"
-              hx-indicator="#snap-recover-spinner"
-              class="flex flex-wrap items-center gap-2">
-          <input name="location" required
-                 placeholder="http://... or file:///path/to.snapshot"
-                 class="qd-input text-xs py-1.5 flex-1 min-w-[260px]">
-          <select name="priority" class="qd-select text-xs py-1.5">
-            <option value="snapshot" selected>priority: snapshot</option>
-            <option value="replica">priority: replica</option>
-            <option value="no_sync">priority: no_sync</option>
-          </select>
-          <button type="submit" class="qd-btn text-xs py-1.5">Recover</button>
-          <div id="snap-recover-spinner" class="htmx-indicator"><div class="qd-spinner"></div></div>
-        </form>
-      </div>
-    </div>
-    <div id="restore-result" class="mt-3"></div>
-  </details>
-
   <div id="snapshots-list"
        hx-get="/api/{{ collection.name }}/snapshots"
        hx-trigger="load"
        hx-swap="innerHTML">
     <div class="flex justify-center py-16"><div class="qd-spinner"></div></div>
+  </div>
+</div>
+
+<!-- ── Tab: Health ── -->
+<div id="tab-health" class="tab-panel hidden">
+  <div class="flex items-center gap-3 mb-4">
+    <button class="qd-btn-ghost text-xs py-1.5"
+            hx-get="/api/{{ collection.name }}/health"
+            hx-target="#health-content"
+            hx-swap="innerHTML"
+            hx-indicator="#health-spinner">Refresh</button>
+    <div id="health-spinner" class="htmx-indicator"><div class="qd-spinner"></div></div>
+  </div>
+  <div id="health-content"
+       hx-get="/api/{{ collection.name }}/health"
+       hx-trigger="intersect once"
+       hx-swap="innerHTML">
+    <div class="flex flex-col items-center gap-3 py-16 text-xs text-[#7b8fb5]"><div class="qd-spinner"></div>Reading telemetry, shard state and facets…</div>
   </div>
 </div>
 

@@ -18,6 +18,8 @@
   </div>
   {% if conn.connected %}
   <div class="flex gap-2">
+    <button onclick="document.getElementById('migrate-coll-modal').classList.remove('hidden')"
+            class="qd-btn-ghost text-xs py-2 px-3">⇄ Migrate</button>
     <button onclick="document.getElementById('restore-coll-modal').classList.remove('hidden')"
             class="qd-btn-ghost text-xs py-2 px-3">↥ From Snapshot</button>
     <button onclick="document.getElementById('create-coll-modal').classList.remove('hidden')"
@@ -119,6 +121,85 @@
     </form>
   </div>
 </div>
+
+<!-- ── Migrate Modal (cross-cluster, version-agnostic) ── -->
+<div id="migrate-coll-modal" class="hidden fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4">
+  <div class="qd-card p-6 w-full max-w-lg">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="font-display font-bold text-lg text-white">Migrate Collection</h3>
+      <button onclick="document.getElementById('migrate-coll-modal').classList.add('hidden')"
+              class="text-[#4b5f82] hover:text-white">×</button>
+    </div>
+    <p class="text-[0.6875rem] text-[#4b5f82] mb-3">
+      Scrolls source via HTTP and upserts into the connected target Qdrant. Version-agnostic. Slow for large collections but works across versions/clusters.
+    </p>
+    <form id="migrate-form" class="space-y-3">
+      <div class="grid grid-cols-2 gap-3">
+        <div class="col-span-2">
+          <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Source URL</label>
+          <input name="source_url" required class="qd-input text-xs py-1.5 w-full"
+                 placeholder="http://other-host:6333">
+        </div>
+        <div>
+          <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Source collection</label>
+          <input name="source_collection" required class="qd-input text-xs py-1.5 w-full">
+        </div>
+        <div>
+          <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Target collection</label>
+          <input name="target_collection" required class="qd-input text-xs py-1.5 w-full">
+        </div>
+        <div>
+          <label class="block text-[0.6875rem] text-[#4b5f82] uppercase tracking-wider mb-1.5">Batch size</label>
+          <input name="batch_size" type="number" min="1" max="2000" value="256"
+                 class="qd-input text-xs py-1.5 w-full">
+        </div>
+        <div class="flex items-center gap-2 mt-6">
+          <input type="checkbox" name="create_target" value="true" id="chk-create-target"
+                 class="w-3.5 h-3.5 rounded bg-[#0e1421] border-[#1a2236] accent-[#00e5a0]" checked>
+          <label for="chk-create-target" class="text-xs text-[#7b8fb5] cursor-pointer">
+            Auto-create target with source schema
+          </label>
+        </div>
+      </div>
+      <div id="migrate-status" class="text-xs text-[#7b8fb5] min-h-[1.5rem]"></div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button type="button"
+                onclick="document.getElementById('migrate-coll-modal').classList.add('hidden')"
+                class="qd-btn-ghost text-xs py-1.5">Cancel</button>
+        <button type="submit" class="qd-btn text-xs py-1.5" id="migrate-submit">Start Migration</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+document.getElementById('migrate-form')?.addEventListener('submit', async function(e) {
+  e.preventDefault();
+  const status = document.getElementById('migrate-status');
+  const btn = document.getElementById('migrate-submit');
+  const fd = new FormData(this);
+  status.textContent = 'Migrating... (no live progress; do not close)';
+  status.style.color = '#fbbf24';
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/collections/migrate', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (j.ok) {
+      status.style.color = '#00e5a0';
+      status.textContent = `Done. Moved ${j.moved.toLocaleString()} points.`;
+      setTimeout(() => location.reload(), 1500);
+    } else {
+      status.style.color = '#f87171';
+      status.textContent = j.error || 'Failed';
+    }
+  } catch (err) {
+    status.style.color = '#f87171';
+    status.textContent = String(err);
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
 {% endif %}
 
 {% if not conn.connected %}

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import numpy as np
@@ -12,21 +16,24 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from qdrant_client import QdrantClient
 
+from app import insights
+
 BASE_DIR = Path(__file__).resolve().parent
 _CONN_STATE_FILE = BASE_DIR.parent / ".qdrant_conn.json"
 
 
-def _load_conn_state() -> tuple[str, int]:
+def _load_conn_state() -> tuple[str, int, dict[str, str]]:
     try:
         data = json.loads(_CONN_STATE_FILE.read_text())
-        return str(data.get("host", "localhost")), int(data.get("port", 6333))
+        peers = data.get("peer_urls") if isinstance(data.get("peer_urls"), dict) else {}
+        return str(data.get("host", "localhost")), int(data.get("port", 6333)), {str(k): str(v) for k, v in peers.items()}
     except Exception:
-        return "localhost", 6333
+        return "localhost", 6333, {}
 
 
-def _save_conn_state(host: str, port: int) -> None:
+def _save_conn_state(host: str, port: int, peer_urls: dict[str, str] | None = None) -> None:
     try:
-        _CONN_STATE_FILE.write_text(json.dumps({"host": host, "port": port}))
+        _CONN_STATE_FILE.write_text(json.dumps({"host": host, "port": port, "peer_urls": peer_urls or {}}))
     except Exception:
         pass
 
@@ -34,9 +41,11 @@ def _save_conn_state(host: str, port: int) -> None:
 # ── Connection state ─────────────────────────────────────────────────
 class QdrantConnection:
     def __init__(self) -> None:
-        h, p = _load_conn_state()
+        h, p, peers = _load_conn_state()
         self.host: str = h
         self.port: int = p
+        # peer_id -> REST base URL reachable from this app (peer URIs in /cluster are cluster-internal).
+        self.peer_urls: dict[str, str] = peers
         self.client: QdrantClient | None = None
         self.connected: bool = False
         self.error: str = ""
@@ -53,7 +62,7 @@ class QdrantConnection:
             self.client.get_collections()
             self.connected = True
             self.error = ""
-            _save_conn_state(self.host, self.port)
+            _save_conn_state(self.host, self.port, self.peer_urls)
         except Exception as exc:
             self.connected = False
             self.client = None
@@ -267,6 +276,104 @@ async def api_create_collection(
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
     return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/api/collections/migrate")
+async def api_migrate_collection(
+    source_url: str = Form(...),
+    source_collection: str = Form(...),
+    target_collection: str = Form(...),
+    batch_size: int = Form(256),
+    create_target: bool = Form(False),
+):
+    if not conn.connected:
+        return JSONResponse({"error": "Not connected to target"}, status_code=400)
+    src = source_url.rstrip("/")
+    target = _qdrant_base_url()
+    moved = 0
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            info_resp = await client.get(f"{src}/collections/{source_collection}")
+            if info_resp.status_code >= 400:
+                return JSONResponse(
+                    {"error": f"Source info failed: {info_resp.status_code} {info_resp.text[:300]}"},
+                    status_code=400,
+                )
+            src_info = info_resp.json().get("result", {})
+            src_cfg = src_info.get("config", {}).get("params", {})
+
+            if create_target:
+                exists = await client.get(f"{target}/collections/{target_collection}")
+                if exists.status_code == 404:
+                    body = {"vectors": src_cfg.get("vectors")}
+                    if src_cfg.get("sparse_vectors"):
+                        body["sparse_vectors"] = src_cfg["sparse_vectors"]
+                    create = await client.put(
+                        f"{target}/collections/{target_collection}", json=body
+                    )
+                    if create.status_code >= 400:
+                        return JSONResponse(
+                            {"error": f"Create target failed: {create.text[:300]}"},
+                            status_code=400,
+                        )
+
+            offset = None
+            while True:
+                scroll_body = {
+                    "limit": batch_size,
+                    "with_payload": True,
+                    "with_vector": True,
+                }
+                if offset is not None:
+                    scroll_body["offset"] = offset
+                sc = await client.post(
+                    f"{src}/collections/{source_collection}/points/scroll",
+                    json=scroll_body,
+                )
+                if sc.status_code >= 400:
+                    return JSONResponse(
+                        {"error": f"Scroll failed at moved={moved}: {sc.text[:300]}"},
+                        status_code=500,
+                    )
+                data = sc.json().get("result", {})
+                points = data.get("points", []) or []
+                if not points:
+                    break
+
+                upsert_body = {
+                    "points": [
+                        {
+                            "id": p["id"],
+                            "vector": p.get("vector"),
+                            "payload": p.get("payload") or {},
+                        }
+                        for p in points
+                    ]
+                }
+                up = await client.put(
+                    f"{target}/collections/{target_collection}/points?wait=true",
+                    json=upsert_body,
+                )
+                if up.status_code >= 400:
+                    return JSONResponse(
+                        {"error": f"Upsert failed at moved={moved}: {up.text[:400]}"},
+                        status_code=500,
+                    )
+                moved += len(points)
+                offset = data.get("next_page_offset")
+                if offset is None:
+                    break
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"Migration error at moved={moved}: {exc}"},
+            status_code=500,
+        )
+    return JSONResponse({
+        "ok": True,
+        "moved": moved,
+        "source": f"{src}/{source_collection}",
+        "target": f"{target}/{target_collection}",
+    })
 
 
 @app.post("/api/collections/restore-from-snapshot")
@@ -1315,89 +1422,479 @@ async def save_snapshot_to_path(
         )
 
 
-@app.post("/api/{name}/snapshots/upload-restore", response_class=HTMLResponse)
-async def restore_from_upload(
-    request: Request,
-    name: str,
-    snapshot_file: UploadFile = File(...),
-    priority: str = Form("snapshot"),
-):
-    if not conn.connected:
-        return HTMLResponse("<p class='text-red-400 p-2 text-xs'>Not connected</p>")
-    import tempfile
+# ── Cluster & collection insights ────────────────────────────────────
+def _fmt_bytes(n) -> str:
+    if isinstance(n, bool) or not isinstance(n, (int, float)):
+        return "—"
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
 
-    tmp_path: Path | None = None
+
+templates.env.filters["bytes"] = _fmt_bytes
+
+
+async def _qget(client: httpx.AsyncClient, path: str, raw: bool = False,
+                base: str | None = None, optional: bool = False):
+    """Returns (payload, error). payload is `result` for JSON endpoints, text when raw.
+    optional=True treats 404 as "not supported by this Qdrant version" rather than an error."""
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".snapshot") as tmp:
-            tmp_path = Path(tmp.name)
-            while True:
-                chunk = await snapshot_file.read(1 << 20)
-                if not chunk:
-                    break
-                tmp.write(chunk)
-        url = f"{_qdrant_base_url()}/collections/{name}/snapshots/upload?priority={priority}"
-        async with httpx.AsyncClient(timeout=None) as client:
-            with tmp_path.open("rb") as f:
-                files = {
-                    "snapshot": (
-                        snapshot_file.filename or "upload.snapshot",
-                        f,
-                        "application/octet-stream",
-                    )
-                }
-                resp = await client.post(url, files=files)
-        if resp.status_code >= 400:
-            return HTMLResponse(
-                f"<p class='text-red-400 p-2 text-xs'>Upload failed: "
-                f"{resp.status_code} {resp.text[:400]}</p>"
+        resp = await client.get(f"{base or _qdrant_base_url()}{path}")
+    except httpx.TimeoutException as exc:
+        return None, f"{path}: timed out ({type(exc).__name__})"
+    except httpx.HTTPError as exc:
+        return None, f"{path}: {type(exc).__name__}: {exc}"
+    if optional and resp.status_code == 404:
+        return None, None
+    if raw:
+        return resp.text, (None if resp.status_code < 400 else f"{path}: HTTP {resp.status_code}")
+    if resp.status_code >= 400:
+        return None, f"{path}: HTTP {resp.status_code} {resp.text[:200]}"
+    try:
+        body = resp.json()
+    except ValueError:
+        return None, f"{path}: non-JSON response"
+    if not isinstance(body, dict):
+        return None, f"{path}: unexpected response shape"
+    return body.get("result"), None
+
+
+def _d(v) -> dict:
+    return v if isinstance(v, dict) else {}
+
+
+def _normalize_url(raw: str) -> str:
+    raw = raw.strip().rstrip("/")
+    return raw if raw.startswith(("http://", "https://")) else f"http://{raw}"
+
+
+async def _peer_bases(client: httpx.AsyncClient) -> tuple[dict, dict[str, str | None]]:
+    """Returns (/cluster of the connected node, peer_id -> reachable base URL or None)."""
+    clus, _ = await _qget(client, "/cluster")
+    clus = _d(clus)
+    self_id = str(clus.get("peer_id") or "")
+    bases: dict[str, str | None] = {}
+    for pid in _d(clus.get("peers")) or ({self_id: {}} if self_id else {}):
+        bases[str(pid)] = _qdrant_base_url() if str(pid) == self_id else conn.peer_urls.get(str(pid))
+    if not bases:
+        # Cluster mode disabled: /cluster has no peer_id, the node is its own only replica holder.
+        bases["local"] = _qdrant_base_url()
+    return clus, bases
+
+
+async def _replica_views(client: httpx.AsyncClient, bases: dict[str, str | None], collection: str,
+                         telemetry: dict[str, dict] | None = None):
+    """Each peer's own view of the collection's shards, plus its per-replica op counters."""
+    q = quote(collection, safe="")
+    reachable = {pid: b for pid, b in bases.items() if b}
+    results = await asyncio.gather(*(_qget(client, f"/collections/{q}/cluster", base=b) for b in reachable.values()))
+    views: dict[str, dict | None] = {pid: None for pid in bases}
+    errors = []
+    for pid, (res, err) in zip(reachable, results):
+        got = str(_d(res).get("peer_id") or "")
+        if res is not None and pid != "local" and got and got != pid:
+            errors.append(f"peer {pid}: endpoint {reachable[pid]} now serves peer {got}; remap it")
+            continue
+        views[pid] = _d(res) if res is not None else None
+        if err:
+            errors.append(f"peer {pid}: {err}")
+    remote_stats = {}
+    for pid, tele in (telemetry or {}).items():
+        for c in _d(_d(tele).get("collections")).get("collections") or []:
+            if c.get("id") == collection:
+                remote_stats[pid] = [r for s in c.get("shards") or [] for r in s.get("remote") or []]
+    return views, remote_stats, errors
+
+
+async def _resolve_peer(client: httpx.AsyncClient, url: str) -> str | None:
+    res, _ = await _qget(client, "/cluster", base=url)
+    pid = _d(res).get("peer_id")
+    return str(pid) if pid is not None else None
+
+
+@app.post("/api/peers/save")
+async def api_peers_save(urls: str = Form("")):
+    if not conn.connected:
+        return RedirectResponse(url="/", status_code=303)
+    candidates = [_normalize_url(u) for u in urls.replace(",", "\n").splitlines() if u.strip()]
+    async with httpx.AsyncClient(timeout=3) as client:
+        clus, _ = await _qget(client, "/cluster")
+        known = {str(p) for p in _d(_d(clus).get("peers"))}
+        resolved = await asyncio.gather(*(_resolve_peer(client, u) for u in candidates))
+    mapped, skipped = {}, []
+    for url, pid in zip(candidates, resolved):
+        if pid and pid in known:
+            mapped[pid] = url
+        else:
+            skipped.append(url)
+    taken = set(mapped.values())
+    conn.peer_urls = {**{k: v for k, v in conn.peer_urls.items() if k not in known and v not in taken}, **mapped}
+    _save_conn_state(conn.host, conn.port, conn.peer_urls)
+    msg = f"Mapped {len(mapped)} peer(s)." + (f" Not part of this cluster or unreachable: {', '.join(skipped)}" if skipped else "")
+    return RedirectResponse(url=f"/cluster?msg={quote(msg)}", status_code=303)
+
+
+@app.post("/api/peers/discover")
+async def api_peers_discover():
+    if not conn.connected:
+        return RedirectResponse(url="/", status_code=303)
+    # ponytail: scans ±20 ports on the connected host, which fits kubectl port-forward setups; type URLs for anything else.
+    ports = [p for p in range(max(1, conn.port - 20), conn.port + 21) if p != conn.port]
+    # Closed ports fail at connect; port-forwarded peers can take ~1 s to answer.
+    async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=0.3)) as client:
+        clus, _ = await _qget(client, "/cluster")
+        self_id = str(_d(clus).get("peer_id") or "")
+        known = {str(p) for p in _d(_d(clus).get("peers"))} - {self_id}
+        urls = [f"http://{conn.host}:{p}" for p in ports]
+        resolved = await asyncio.gather(*(_resolve_peer(client, u) for u in urls))
+    found = {}
+    for url, pid in zip(urls, resolved):
+        if pid in known and pid not in found:
+            found[pid] = url
+    taken = set(found.values())
+    conn.peer_urls = {pid: u for pid, u in conn.peer_urls.items() if u not in taken or found.get(pid) == u}
+    conn.peer_urls.update(found)
+    _save_conn_state(conn.host, conn.port, conn.peer_urls)
+    missing = known - set(conn.peer_urls)
+    msg = f"Discovered {len(found)} peer endpoint(s) on {conn.host}:{ports[0]}–{ports[-1]}." + (
+        f" Still unmapped: {', '.join(sorted(missing))}" if missing else "")
+    return RedirectResponse(url=f"/cluster?msg={quote(msg)}", status_code=303)
+
+
+@app.get("/cluster", response_class=HTMLResponse)
+async def cluster_page(request: Request):
+    if not conn.connected:
+        return RedirectResponse(url="/")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=2.0)) as client:
+        (tele, e1), (clus, e2), (cltele, e3), (quotas, e4), (issues, e5), (metrics_txt, e6), \
+            (healthz, _), (readyz, e8), (snaps, e9) = await asyncio.gather(
+                _qget(client, "/telemetry?details_level=3"),
+                _qget(client, "/cluster"),
+                _qget(client, "/cluster/telemetry"),
+                _qget(client, "/quotas", optional=True),
+                _qget(client, "/issues"),
+                _qget(client, "/metrics", raw=True),
+                _qget(client, "/healthz", raw=True),
+                _qget(client, "/readyz", raw=True),
+                _qget(client, "/snapshots"),
             )
-        return HTMLResponse(
-            f"<p class='text-[#00e5a0] p-2 text-xs'>Restored from "
-            f"<span class='font-mono'>{snapshot_file.filename}</span> into "
-            f"<span class='font-mono'>{name}</span></p>"
+        tele = _d(tele)
+        coll_ids = [c.get("id") for c in _d(tele.get("collections")).get("collections") or [] if c.get("id")]
+        (slow, e10), *mem_results = await asyncio.gather(
+            _qget(client, "/profiler/slow_requests?limit=20", optional=True),
+            *(_qget(client, f"/collections/{quote(cid, safe='')}/memory") for cid in coll_ids),
         )
-    except Exception as exc:
-        return HTMLResponse(
-            f"<p class='text-red-400 p-2 text-xs'>Restore failed: {exc}</p>"
-        )
-    finally:
-        if tmp_path and tmp_path.exists():
+
+        self_id = str(_d(clus).get("peer_id") or "")
+        bases = {str(pid): (_qdrant_base_url() if str(pid) == self_id else conn.peer_urls.get(str(pid)))
+                 for pid in _d(_d(clus).get("peers"))}
+        others = {pid: b for pid, b in bases.items() if b and pid != self_id}
+        peer_fetch = await asyncio.gather(*(
+            asyncio.gather(_qget(client, "/cluster", base=b), _qget(client, "/telemetry?details_level=3", base=b),
+                           _qget(client, "/metrics", raw=True, base=b))
+            for b in others.values()
+        ))
+        peer_live = {self_id: {"cluster": _d(clus), "telemetry": tele, "metrics": metrics_txt or "", "error": None}}
+        for pid, ((pc, pe1), (pt, pe2), (pm, pe3)) in zip(others, peer_fetch):
+            got = str(_d(pc).get("peer_id") or "")
+            if got and got != pid:
+                # Port-forwards get reshuffled; never show another peer's data under this id.
+                bases[pid] = None
+                peer_live[pid] = {"cluster": {}, "telemetry": {}, "metrics": "",
+                                  "error": f"{others[pid]} now serves peer {got}; remap it"}
+                continue
+            peer_live[pid] = {"cluster": _d(pc), "telemetry": _d(pt), "metrics": pm or "", "error": pe1 or pe2 or pe3}
+        if not bases:
+            bases["local"] = _qdrant_base_url()
+        tele_by_peer = {pid: v["telemetry"] for pid, v in peer_live.items()}
+        replica_results = await asyncio.gather(*(_replica_views(client, bases, cid, tele_by_peer) for cid in coll_ids))
+    replicas_by_coll = {}
+    replica_findings = []
+    for cid, (views, rstats, rerr) in zip(coll_ids, replica_results):
+        mx = insights.replica_matrix(views, rstats)
+        replicas_by_coll[cid] = mx
+        replica_findings += [(lvl, f"{cid}: {msg}") for lvl, msg in mx["findings"] if lvl != "info"]
+    unmapped = sorted(pid for pid, b in bases.items() if not b)
+    stale = {pid: v["error"] for pid, v in peer_live.items() if v["error"] and "now serves peer" in v["error"]}
+    errors_extra = list(stale.values())
+    mem_by_coll = {cid: _d(m) for cid, (m, _) in zip(coll_ids, mem_results)}
+    errors = [e for e in (e1, e2, e3, e4, e5, e6, e8, e9, e10) if e] + errors_extra
+    version = tuple(int(x) for x in re.findall(r"\d+", str(_d(tele.get("app")).get("version") or ""))[:2]) or (0, 0)
+    mem_supported = version >= (1, 18)
+    mem_errors = [e for _, e in mem_results if e] if mem_supported else []
+    clus, cltele, quotas = _d(clus), _d(cltele), _d(quotas)
+    metrics = insights.parse_prom(metrics_txt or "")
+
+    app_info = _d(tele.get("app"))
+    system = _d(app_info.get("system"))
+    ram_total = insights.kb_to_bytes(system.get("ram_size"))
+    disk_total = insights.kb_to_bytes(system.get("disk_size"))
+
+    hw = _d(_d(tele.get("hardware")).get("collection_data"))
+    coll_rows = []
+    mem_totals = {k: 0 for k in ("disk_bytes", "ram_bytes", "cached_bytes", "expected_cache_bytes", "warm_cached_bytes")}
+    for c in _d(tele.get("collections")).get("collections") or []:
+        shards = c.get("shards") or []
+        local = [_d(s.get("local")) for s in shards if s.get("local")]
+        vbytes = sum(l.get("vectors_size_bytes") or 0 for l in local)
+        pbytes = sum(l.get("payloads_size_bytes") or 0 for l in local)
+        nbyname: dict[str, int] = {}
+        for l in local:
+            for k, v in _d(l.get("num_vectors_by_name")).items():
+                nbyname[k] = nbyname.get(k, 0) + (v or 0)
+        tiers = insights.memory_tiers(_d(c.get("config")), nbyname, vbytes, pbytes)
+        usage = insights.memory_usage(mem_by_coll[c["id"]], tiers) if mem_by_coll.get(c.get("id")) else None
+        if usage:
+            for k in mem_totals:
+                mem_totals[k] += usage["total"][k]
+        states = [st for s in shards for st in _d(s.get("replicate_states")).values()]
+        cfg_params = _d(_d(c.get("config")).get("params"))
+        coll_rows.append({
+            "name": c.get("id"),
+            "points": sum(l.get("num_points") or 0 for l in local),
+            "shards": len(shards),
+            "replication": cfg_params.get("replication_factor") or 1,
+            "states": sorted(set(states)),
+            "vectors_bytes": vbytes,
+            "payload_bytes": pbytes,
+            "tiers": tiers,
+            "usage": usage["total"] if usage else None,
+            "transfers": len(c.get("transfers") or []),
+            "hw": _d(hw.get(c.get("id"))),
+            "replicas": replicas_by_coll.get(c.get("id")),
+            "running_opt": insights.prom_sum(
+                metrics, "collection_running_optimizations", lambda lb, n=c.get("id"): lb.get("id") == n),
+        })
+
+    peers = []
+    peer_details = _d(_d(cltele.get("cluster")).get("peers"))
+    for pid, p in _d(clus.get("peers")).items():
+        det = _d(peer_details.get(pid))
+        live = peer_live.get(str(pid))
+        live_raft = _d(_d(live["cluster"]).get("raft_info")) if live else {}
+        live_metrics = insights.parse_prom(live["metrics"]) if live else {}
+        peers.append({
+            "id": pid,
+            "uri": p.get("uri"),
+            "endpoint": bases.get(str(pid)),
+            "live_error": live["error"] if live else None,
+            "live_raft": live_raft,
+            "resident": insights.prom_sum(live_metrics, "memory_resident_bytes"),
+            "ram_total": insights.kb_to_bytes(_d(_d(_d(live["telemetry"]).get("app")).get("system")).get("ram_size")) if live else None,
+            "collections": insights.prom_sum(live_metrics, "collections_total"),
+            "responsive": det.get("responsive"),
+            "version": _d(det.get("details")).get("version")
+                       or _d(_d(_d(tele.get("cluster")).get("peer_metadata")).get(pid)).get("version"),
+            "role": _d(det.get("details")).get("role"),
+            "is_self": str(clus.get("peer_id")) == str(pid),
+            "quota": _d(_d(quotas.get("peers")).get(pid)),
+            "send_failures": _d(clus.get("message_send_failures")).get(pid),
+        })
+
+    def ratio(a, b):
+        a, b = insights.prom_sum(metrics, a), insights.prom_sum(metrics, b)
+        return (a, b, (a / b * 100) if a is not None and b else None)
+
+    raft = _d(clus.get("raft_info"))
+    versions = {p["version"] for p in peers if p["version"]}
+    live_rafts = [p["live_raft"] for p in peers if p["live_raft"]]
+    leaders = {r.get("leader") for r in live_rafts}
+    terms = {r.get("term") for r in live_rafts}
+    quota_exceeded = {k: v for k, v in _d(_d(tele.get("quota")).get("exceeded")).items() if v}
+    leader_id = str(raft.get("leader", "")) if raft.get("leader") is not None else ""
+    leader_ep = bases.get(leader_id) if leader_id else None
+    standalone = clus.get("status") == "disabled"
+    health = [
+        ("leader", bool(leader_id) or standalone,
+         "standalone (cluster mode disabled)" if standalone else
+         (("this peer · " if leader_id == self_id else "") + f"…{leader_id[-6:]}"
+          + (f" · {leader_ep.replace('http://', '')}" if leader_ep else "")
+          + f" · term {raft.get('term')}") if leader_id else "no leader elected"),
+        ("healthz", healthz is not None and "passed" in healthz, (healthz or "unreachable").strip()),
+        ("readyz", not e8, (readyz or e8 or "").strip()),
+        ("issues", not (issues or {}).get("issues"), f"{len((issues or {}).get('issues') or [])} open"),
+        ("consensus", _d(clus.get("consensus_thread_status")).get("consensus_thread_status") in (None, "working"),
+         _d(clus.get("consensus_thread_status")).get("consensus_thread_status") or "n/a"),
+        ("recovery mode", not _d(app_info.get("features")).get("recovery_mode"),
+         "on" if _d(app_info.get("features")).get("recovery_mode") else "off"),
+        ("quota", not quota_exceeded, ", ".join(quota_exceeded) + " exceeded" if quota_exceeded else "ok"),
+        ("versions", len(versions) <= 1, ", ".join(sorted(versions)) or "—"),
+        ("raft views", len(leaders) <= 1 and len(terms) <= 1,
+         (f"{len(live_rafts)}/{len(peers) or 1} checked, agree" if len(live_rafts) > 1 else "only this peer checked")
+         if len(leaders) <= 1 and len(terms) <= 1
+         else f"leaders {sorted(map(str, leaders))} · terms {sorted(map(str, terms))}"),
+        ("replicas", not any(lvl == "error" for lvl, _ in replica_findings),
+         ", ".join(x for x in (
+             f"{sum(1 for lvl, _ in replica_findings if lvl == 'error')} error(s)",
+             f"{sum(1 for lvl, _ in replica_findings if lvl == 'warn')} warning(s)",
+             f"{len(unmapped)} peer(s) unverified" if unmapped else "",
+         ) if x and not x.startswith("0 "))
+         or "ok"),
+    ]
+
+    snap_list = snaps if isinstance(snaps, list) else []
+    return _render(request, "cluster.html", {
+        "conn": conn,
+        "errors": errors,
+        "health": health,
+        "replica_findings": replica_findings,
+        "leader_id": leader_id,
+        "self_id": self_id,
+        "unmapped": unmapped,
+        "msg": request.query_params.get("msg", ""),
+        "app_info": app_info,
+        "system": system,
+        "ram_total": ram_total,
+        "disk_total": disk_total,
+        "memory": _d(tele.get("memory")),
+        "quotas": quotas,
+        "search_pool": _d(tele.get("search_pool")),
+        "cluster": clus,
+        "cluster_cfg": _d(_d(tele.get("cluster")).get("config")),
+        "raft": raft,
+        "peers": peers,
+        "issues": (issues or {}).get("issues") or [],
+        "collections": coll_rows,
+        "mem_totals": mem_totals,
+        "mem_available": any(mem_by_coll.values()),
+        "mem_supported": mem_supported,
+        "mem_errors": mem_errors[:3],
+        # Qdrant < 1.19 reports the host machine's RAM/cores, not the container's cgroup limit (qdrant#9891).
+        "host_limits": version < (1, 19),
+        "slow_requests": _d(slow).get("requests") or [],
+        "fds": ratio("process_open_fds", "process_max_fds"),
+        "mmaps": ratio("process_open_mmaps", "system_max_mmaps"),
+        "latency": insights.latency_table(metrics)[:30],
+        "full_snapshots": snap_list,
+        "full_snapshots_bytes": sum(s.get("size") or 0 for s in snap_list),
+    })
+
+
+@app.get("/api/cluster/sample")
+async def cluster_sample():
+    if not conn.connected:
+        return JSONResponse({"error": "Not connected"}, status_code=400)
+    async with httpx.AsyncClient(timeout=10) as client:
+        txt, err = await _qget(client, "/metrics", raw=True)
+    if err:
+        return JSONResponse({"error": err}, status_code=502)
+    return {"ts": time.time(), **insights.sample(insights.parse_prom(txt))}
+
+
+@app.get("/api/{name}/health", response_class=HTMLResponse)
+async def collection_health(request: Request, name: str):
+    if not conn.connected:
+        return HTMLResponse("<p class='text-red-400 p-4 text-xs'>Not connected</p>")
+    q = quote(name, safe="")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=2.0)) as client:
+        # ponytail: telemetry has no per-collection filter, so level 6 pulls every collection's segments; fine for a handful of collections.
+        (info, e1), (shard_info, e2), (opts, e3), (tele, e4), (mem, e5), (metrics_txt, e6), (slow, e7) = \
+            await asyncio.gather(
+                _qget(client, f"/collections/{q}"),
+                _qget(client, f"/collections/{q}/cluster"),
+                _qget(client, f"/collections/{q}/optimizations"),
+                _qget(client, "/telemetry?details_level=6"),
+                _qget(client, f"/collections/{q}/memory", optional=True),
+                _qget(client, "/metrics?per_collection=true", raw=True),
+                # ponytail: endpoint has no collection filter; 100 covers 32-per-type capacity for the common types.
+                _qget(client, "/profiler/slow_requests?limit=100", optional=True),
+            )
+        clus, bases = await _peer_bases(client)
+        self_id = str(clus.get("peer_id") or "")
+        others = {pid: b for pid, b in bases.items() if b and pid != self_id}
+        other_tele = await asyncio.gather(*(_qget(client, "/telemetry?details_level=3", base=b) for b in others.values()))
+        tele_by_peer = {self_id: _d(tele), **{pid: _d(t) for pid, (t, _) in zip(others, other_tele)}}
+        views, remote_stats, view_errors = await _replica_views(client, bases, name, tele_by_peer)
+        if "local" in bases and views.get("local"):
+            real = str(views["local"].get("peer_id") or "local")
+            bases, self_id = {real: bases["local"]}, real
+            views = {real: views["local"]}
+        info = _d(info)
+        facet_fields = [
+            f for f, fi in _d(info.get("payload_schema")).items()
+            if fi.get("data_type") in ("keyword", "bool", "integer") and (fi.get("points") or 0) > 0
+        ]
+
+        async def facet(field: str):
             try:
-                tmp_path.unlink()
-            except Exception:
-                pass
+                r = await client.post(
+                    f"http://{conn.host}:{conn.port}/collections/{q}/facet",
+                    json={"key": field, "limit": 10, "exact": False},
+                )
+                hits = _d(r.json().get("result")).get("hits") if r.status_code < 400 else None
+                return field, hits or []
+            except (httpx.HTTPError, ValueError):
+                return field, []
 
+        facets = dict(await asyncio.gather(*(facet(f) for f in facet_fields)))
 
-@app.post("/api/{name}/snapshots/recover-url", response_class=HTMLResponse)
-async def restore_from_url(
-    request: Request,
-    name: str,
-    location: str = Form(...),
-    priority: str = Form("snapshot"),
-):
-    if not conn.connected:
-        return HTMLResponse("<p class='text-red-400 p-2 text-xs'>Not connected</p>")
-    try:
-        url = f"{_qdrant_base_url()}/collections/{name}/snapshots/recover"
-        async with httpx.AsyncClient(timeout=None) as client:
-            resp = await client.put(
-                url,
-                json={"location": location, "priority": priority},
-            )
-        if resp.status_code >= 400:
-            return HTMLResponse(
-                f"<p class='text-red-400 p-2 text-xs'>Recover failed: "
-                f"{resp.status_code} {resp.text[:400]}</p>"
-            )
-        return HTMLResponse(
-            f"<p class='text-[#00e5a0] p-2 text-xs'>Recovered from "
-            f"<span class='font-mono'>{location}</span> into "
-            f"<span class='font-mono'>{name}</span></p>"
-        )
-    except Exception as exc:
-        return HTMLResponse(
-            f"<p class='text-red-400 p-2 text-xs'>Recover failed: {exc}</p>"
-        )
+    errors = [e for e in (e1, e2, e3, e4, e5, e6, e7) if e] + view_errors
+    tele = _d(tele)
+    replicas = insights.replica_matrix(views, remote_stats)
+    raft_leader = str(_d(clus.get("raft_info")).get("leader") or "")
+    coll_tele = next(
+        (c for c in _d(tele.get("collections")).get("collections") or [] if c.get("id") == name), {}
+    )
+    segments, opt_log, nbyname, vbytes, pbytes = [], [], {}, 0, 0
+    for s in coll_tele.get("shards") or []:
+        local = _d(s.get("local"))
+        segments += local.get("segments") or []
+        opt_log += _d(local.get("optimizations")).get("log") or []
+        vbytes += local.get("vectors_size_bytes") or 0
+        pbytes += local.get("payloads_size_bytes") or 0
+        for k, v in _d(local.get("num_vectors_by_name")).items():
+            nbyname[k] = nbyname.get(k, 0) + (v or 0)
+
+    tiers = insights.memory_tiers(_d(info.get("config")), nbyname, vbytes, pbytes)
+    usage = insights.memory_usage(_d(mem), tiers, _d(info.get("payload_schema"))) if _d(mem) else None
+    coll_metrics = insights.filter_metrics(insights.parse_prom(metrics_txt or ""), collection=name)
+    points = info.get("points_count") or 0
+    pindex = [
+        {
+            "field": f,
+            "type": fi.get("data_type"),
+            "points": fi.get("points") or 0,
+            "coverage": (fi.get("points") or 0) / points * 100 if points else None,
+            "flags": [k for k in ("is_tenant", "is_principal", "on_disk") if _d(fi.get("params")).get(k)]
+                     + (["hnsw"] if _d(fi.get("params")).get("enable_hnsw") else []),
+        }
+        for f, fi in _d(info.get("payload_schema")).items()
+    ]
+    pindex.sort(key=lambda r: r["points"])
+
+    return _render(request, "partials/health.html", {
+        "errors": errors,
+        "warnings": sorted(
+            replicas["findings"] + [
+                w for w in insights.collection_warnings(
+                    info, shard_info if isinstance(shard_info, dict) else None, segments, tiers, usage)
+                # replica_matrix reports shard state with every peer's view, so drop the single-peer duplicate.
+                if not w[1].startswith("Shard ")
+            ],
+            key=lambda w: {"error": 0, "warn": 1}.get(w[0], 2),
+        ),
+        "replicas": replicas,
+        "peer_bases": bases,
+        "self_id": self_id,
+        "raft_leader": raft_leader,
+        "replication_factor": _d(_d(info.get("config")).get("params")).get("replication_factor") or 1,
+        "states_info": insights.REPLICA_STATES,
+        "shard_info": _d(shard_info),
+        "optimizations": _d(opts),
+        "opt_log": sorted(opt_log, key=lambda o: o.get("start_at") or "", reverse=True)[:15],
+        "segments": [{**_d(s.get("info")), "config": _d(s.get("config"))} for s in segments],
+        "tiers": tiers,
+        "usage": usage,
+        "latency": insights.latency_table(coll_metrics),
+        "slow_requests": [r for r in _d(slow).get("requests") or [] if r.get("collection_name") == name][:20],
+        "search_stats": insights.search_stats(segments),
+        "pindex": pindex,
+        "facets": facets,
+        "points": points,
+        "hw": _d(_d(_d(tele.get("hardware")).get("collection_data")).get(name)),
+    })
 
 
 # ── Entry point ──────────────────────────────────────────────────────

@@ -29,7 +29,7 @@
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
   <script src="https://d3js.org/d3.v7.min.js"></script>
 
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body class="dot-grid font-body text-[#94a8c8] min-h-screen">
 
@@ -57,6 +57,12 @@
       </a>
 
       <div class="flex items-center gap-6">
+        {% if conn.connected %}
+        <div class="flex items-center gap-1 text-xs font-mono">
+          <a href="/" class="px-3 py-1.5 rounded {{ 'text-[#00e5a0] bg-[rgba(0,229,160,0.08)]' if request.url.path == '/' or request.url.path.startswith('/collection') else 'text-[#7b8fb5] hover:text-white' }}">Collections</a>
+          <a href="/cluster" class="px-3 py-1.5 rounded {{ 'text-[#00e5a0] bg-[rgba(0,229,160,0.08)]' if request.url.path == '/cluster' else 'text-[#7b8fb5] hover:text-white' }}">Cluster</a>
+        </div>
+        {% endif %}
         <!-- Status -->
         <div class="flex items-center gap-2.5">
           {% if conn.connected %}

@@ -1,0 +1,419 @@
+{% if errors %}
+<div class="qd-card p-4 mb-5">
+  <p class="text-xs text-[#f87171] font-semibold mb-1">Some endpoints did not answer; affected panels are incomplete.</p>
+  <ul class="text-xs font-mono text-[#f87171] space-y-0.5">{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+<!-- ── Findings ── -->
+<section class="qd-card p-5 mb-5">
+  <h2 class="hud-title">Findings <span class="hud-sub">rule-based checks on config, shards, segments and indexes</span></h2>
+  {% if not warnings %}
+  <p class="text-xs text-[#4ade80]">● No findings. Shards are active, indexes are populated and no segment is near vacuum.</p>
+  {% else %}
+  <ul class="space-y-2 text-xs">
+    {% for level, msg in warnings %}
+    <li class="flex items-start gap-3">
+      {% if level == 'error' %}<span class="badge badge-red shrink-0 min-w-[4.75rem] justify-center whitespace-nowrap">▲ error</span>
+      {% elif level == 'warn' %}<span class="badge badge-yellow shrink-0 min-w-[4.75rem] justify-center whitespace-nowrap">▲ warn</span>
+      {% else %}<span class="badge badge-blue shrink-0 min-w-[4.75rem] justify-center whitespace-nowrap">ℹ info</span>{% endif %}
+      <span class="text-[#d0dce8] leading-5">{{ msg }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+
+{% if usage %}
+{% set tot = usage.total %}
+<section class="qd-card p-5 mb-5">
+  <div class="flex items-start justify-between flex-wrap gap-4 mb-1">
+    <h2 class="hud-title">Memory <span class="hud-sub">measured per component · tier from config</span></h2>
+    <div class="flex gap-6 text-xs">
+      <div><div class="stat-number text-lg">{{ tot.disk_bytes | bytes }}</div><div class="stat-label">disk</div></div>
+      <div><div class="stat-number text-lg">{{ tot.ram_bytes | bytes }}</div><div class="stat-label">heap</div></div>
+      <div><div class="stat-number text-lg">{{ tot.cached_bytes | bytes }}</div><div class="stat-label">page cache</div></div>
+      <div><div class="stat-number text-lg {% if tot.warm_pct is not none and tot.warm_pct < 80 %}text-[#fbbf24]{% endif %}">{{ '%.0f%%' | format(tot.warm_pct) if tot.warm_pct is number else '—' }}</div><div class="stat-label">warm</div></div>
+    </div>
+  </div>
+  <div class="overflow-x-auto">
+    <table class="qd-table w-full text-xs">
+      <thead><tr>
+        <th class="text-left px-3 py-2">Component</th><th class="text-left px-3 py-2">Tier</th>
+        <th class="text-left px-3 py-2">Set by</th><th class="text-right px-3 py-2">Disk</th>
+        <th class="text-right px-3 py-2">Heap</th><th class="text-right px-3 py-2">Page cache</th>
+        <th class="text-right px-3 py-2">Expected cache</th><th class="text-left px-3 py-2 w-36">Warm</th>
+      </tr></thead>
+      <tbody>
+      {% for r in usage.rows %}
+      {% set empty_index = r.group == 'payload index' and r.indexed_points == 0 %}
+      <tr>
+        <td class="px-3 py-2 font-mono text-[#d0dce8] whitespace-nowrap">
+          <span class="text-[#7b8fb5]">{{ r.group }}</span>{% if r.name %} · {{ r.name }}{% endif %}{% if r.part %} <span class="text-[#38bdf8]">{{ r.part }}</span>{% endif %}
+          {% if empty_index %}<span class="badge badge-yellow ml-1">▲ 0 points</span>{% endif %}
+        </td>
+        <td class="px-3 py-2">{% if r.tier %}<span class="tier tier-{{ r.tier }}">{{ r.tier }}</span>{% else %}—{% endif %}</td>
+        <td class="px-3 py-2 text-[#7b8fb5] whitespace-nowrap">{{ r.source or '—' }}</td>
+        <td class="px-3 py-2 text-right font-mono whitespace-nowrap {% if empty_index %}text-[#fbbf24]{% endif %}">{{ r.disk_bytes | bytes }}</td>
+        <td class="px-3 py-2 text-right font-mono whitespace-nowrap">{{ r.ram_bytes | bytes if r.ram_bytes else '—' }}</td>
+        <td class="px-3 py-2 text-right font-mono whitespace-nowrap">{{ r.cached_bytes | bytes if r.cached_bytes else '—' }}</td>
+        <td class="px-3 py-2 text-right font-mono whitespace-nowrap">{{ r.expected_cache_bytes | bytes if r.expected_cache_bytes else '—' }}</td>
+        <td class="px-3 py-2">
+          {% if r.warm_pct is not none %}
+          <div class="flex items-center gap-2">
+            <div class="meter flex-1 {% if r.warm_pct < 50 %}meter-bad{% elif r.warm_pct < 80 %}meter-warn{% endif %}"><span style="width: {{ r.warm_pct }}%"></span></div>
+            <span class="font-mono w-10 text-right">{{ r.warm_pct | round(0) | int }}%</span>
+          </div>
+          {% else %}<span class="text-[#7b8fb5]">n/a</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="text-[0.6875rem] text-[#7b8fb5] mt-2">
+    <b class="text-[#94a8c8]">Heap</b> is non-evictable RAM (pinned). <b class="text-[#94a8c8]">Page cache</b> is file data the OS currently holds in RAM;
+    <b class="text-[#94a8c8]">expected cache</b> is what Qdrant wants cached for full speed. Warm = page cache ÷ expected.
+    Qdrant notes heap is typically underestimated by 10–15%.
+  </p>
+</section>
+{% else %}
+<section class="qd-card p-5 mb-5">
+
+    <h2 class="hud-title">Memory tiers <span class="hud-sub">effective placement per component</span></h2>
+    <div class="overflow-x-auto">
+    <table class="qd-table w-full text-xs">
+      <thead><tr>
+        <th class="text-left px-3 py-2">Component</th><th class="text-left px-3 py-2">Tier</th>
+        <th class="text-left px-3 py-2">Set by</th><th class="text-right px-3 py-2">Size</th>
+      </tr></thead>
+      <tbody>
+      {% for t in tiers %}
+      <tr>
+        <td class="px-3 py-2 font-mono text-[#d0dce8]">{{ t.component }}</td>
+        <td class="px-3 py-2"><span class="tier tier-{{ t.tier }}">{{ t.tier }}</span></td>
+        <td class="px-3 py-2 text-[#7b8fb5]">{{ t.source }}</td>
+        <td class="px-3 py-2 text-right font-mono whitespace-nowrap">{{ t.bytes | bytes }}{% if t.estimated %} <span class="text-[#7b8fb5]">est.</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <p class="text-[0.6875rem] text-[#7b8fb5] mt-2">Legacy flags map to tiers as in Qdrant 1.19+: <span class="font-mono">on_disk</span> → cold, <span class="font-mono">always_ram</span> → pinned. Payload indexes and the ID tracker are pinned by default.</p>
+  </section>
+{% endif %}
+
+<!-- ── Replicas ── -->
+<section class="qd-card p-5 mb-5">
+  {% set unver = replicas.unreachable %}
+  <div class="flex items-start justify-between flex-wrap gap-3">
+    <h2 class="hud-title">Replicas <span class="hud-sub">each replica as reported by the peer that holds it, and how every other peer sees it</span></h2>
+    {% if unver %}
+    <a href="/cluster#peer-endpoints" class="qd-btn-ghost text-xs py-1.5 px-3">Map {{ unver | length }} peer endpoint{{ 's' if unver | length != 1 }}…</a>
+    {% endif %}
+  </div>
+  {% for sh in replicas.shards %}
+  {% set rf_ok = sh.readable >= replication_factor %}
+  <div class="mb-5 last:mb-0">
+    <div class="flex items-center gap-3 text-xs mb-2">
+      <span class="font-mono text-[#d0dce8]">shard {{ sh.shard_id }}</span>
+      {% if sh.replicas and sh.replicas[0].shard_key %}<span class="badge badge-blue">key {{ sh.replicas[0].shard_key }}</span>{% endif %}
+      <span class="badge {{ 'badge-green' if rf_ok else ('badge-red' if sh.readable == 0 else 'badge-yellow') }}">
+        {{ '●' if rf_ok else '▲' }} {{ sh.readable }}/{{ replication_factor }} readable
+      </span>
+      {% if sh.max_points is not none %}<span class="text-[#7b8fb5]">largest replica {{ '{:,}'.format(sh.max_points) }} points</span>{% endif %}
+    </div>
+    <div class="overflow-x-auto">
+      <table class="qd-table w-full text-xs">
+        <thead><tr>
+          <th class="text-left px-3 py-2">Peer</th>
+          <th class="text-left px-3 py-2">Own state</th>
+          <th class="text-right px-3 py-2">Points</th>
+          <th class="text-right px-3 py-2">Δ vs largest</th>
+          <th class="text-left px-3 py-2">Seen by peers</th>
+          <th class="text-left px-3 py-2">Traffic from peers <span class="normal-case tracking-normal">(updates · failed · searches)</span></th>
+        </tr></thead>
+        <tbody>
+        {% for r in sh.replicas %}
+        {% set ok = r.readable and not r.disagree %}
+        <tr class="{% if not ok %}bg-[rgba(239,68,68,0.05)]{% endif %}">
+          <td class="px-3 py-2 whitespace-nowrap">
+            <span class="font-mono text-[#38bdf8]">{{ r.peer }}</span>
+            {% if r.peer == self_id %}<span class="badge badge-blue ml-1">this</span>{% endif %}
+            {% if r.peer == raft_leader %}<span class="badge ml-1 text-[#f0abfc] border border-[rgba(240,171,252,0.3)] bg-[rgba(240,171,252,0.08)]">◆ leader</span>{% endif %}
+            <div class="text-[0.6875rem] font-mono text-[#7b8fb5]">{{ peer_bases.get(r.peer) or 'no endpoint' }}</div>
+          </td>
+          <td class="px-3 py-2">
+            {% if r.state %}
+            {% set st = r.state %}
+            <span class="badge {{ 'badge-green' if st == 'Active' else ('badge-yellow' if states_info.get(st, {}).get('readable') else 'badge-red') }}"
+                  title="{{ states_info.get(st, {}).get('meaning', '') }}">{{ '● ' if st == 'Active' else '▲ ' }}{{ st }}</span>
+            {% if r.disagree %}<div class="text-[0.6875rem] text-[#f87171] mt-1">▲ disputed by other peers</div>{% endif %}
+            {% else %}<span class="text-[#7b8fb5]">unverified</span>{% endif %}
+          </td>
+          <td class="px-3 py-2 text-right font-mono {% if r.points == 0 and sh.max_points %}text-[#f87171]{% endif %}">
+            {{ '{:,}'.format(r.points) if r.points is number else '—' }}
+          </td>
+          <td class="px-3 py-2 text-right font-mono whitespace-nowrap {% if r.delta %}text-[#fbbf24]{% endif %}">
+            {% if r.delta is none %}—{% elif r.delta == 0 %}<span class="text-[#4ade80]">● in sync</span>{% else %}▲ {{ '{:+,}'.format(r.delta) }}{% endif %}
+          </td>
+          <td class="px-3 py-2">
+            <div class="flex flex-wrap gap-1">
+            {% for viewer, st in r.seen | dictsort %}
+              <span class="tier {{ 'tier-cached' if st == 'Active' else 'tier-pinned' }}" title="peer {{ viewer }}: {{ states_info.get(st, {}).get('meaning', '') }}">
+                {{ 'self' if viewer == r.peer else '…' ~ viewer[-4:] }}: {{ st }}
+              </span>
+            {% endfor %}
+            {% if r.disagree %}<span class="badge badge-red">▲ views disagree</span>{% endif %}
+            </div>
+          </td>
+          <td class="px-3 py-2 font-mono">
+            {% for viewer, op in r.ops | dictsort %}
+            <div class="{% if op.update_failures %}text-[#fbbf24]{% else %}text-[#7b8fb5]{% endif %}">
+              …{{ viewer[-4:] }}: {{ '{:,}'.format(op.updates) }} · {% if op.update_failures %}▲ {% endif %}{{ op.update_failures }} · {{ '{:,}'.format(op.searches) }}
+            </div>
+            {% else %}<span class="text-[#7b8fb5]">—</span>{% endfor %}
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% else %}
+  <p class="text-xs text-[#7b8fb5]">No shard information returned.</p>
+  {% endfor %}
+
+  {% if shard_info.shard_transfers %}
+  <h3 class="text-xs uppercase tracking-wider text-[#fbbf24] mt-4 mb-2">▲ Transfers in progress</h3>
+  <ul class="space-y-1 text-xs font-mono">
+    {% for t in shard_info.shard_transfers %}
+    <li>shard {{ t.shard_id }}: {{ t.from }} → {{ t.to }} · {{ t.method or '' }} · {{ 'sync' if t.sync else 'move' }}{% if t.comment %} · {{ t.comment }}{% endif %}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% if shard_info.resharding_operations %}
+  <h3 class="text-xs uppercase tracking-wider text-[#fbbf24] mt-4 mb-2">▲ Resharding</h3>
+  <ul class="space-y-1 text-xs font-mono">
+    {% for r in shard_info.resharding_operations %}<li>{{ r.direction }} · shard {{ r.shard_id }} on peer {{ r.peer_id }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+
+  {% set present = [] %}
+  {% for sh in replicas.shards %}{% for r in sh.replicas %}{% for st in r.seen.values() %}{% if st != 'Active' and st not in present %}{% set _ = present.append(st) %}{% endif %}{% endfor %}{% endfor %}{% endfor %}
+  {% if present %}
+  <dl class="mt-4 pt-3 border-t border-[#1a2236] space-y-1 text-[0.6875rem]">
+    {% for st in present %}
+    <div class="flex gap-2"><dt class="font-mono text-[#f0abfc] shrink-0">{{ st }}</dt>
+      <dd class="text-[#94a8c8]">{{ states_info.get(st, {}).get('meaning', 'Unknown state.') }}
+        <span class="text-[#7b8fb5]">· reads {{ 'yes' if states_info.get(st, {}).get('readable') else 'no' }} · writes {{ 'yes' if states_info.get(st, {}).get('updatable') else 'no' }} · auto-recovery {{ 'yes' if states_info.get(st, {}).get('auto_recovery') else 'no' }}</span></dd></div>
+    {% endfor %}
+  </dl>
+  {% endif %}
+  <p class="text-[0.6875rem] text-[#7b8fb5] mt-2">
+    "Own state" and points come from the peer holding the replica; "seen by" is each peer's consensus view of it.
+    Traffic counters are per peer since startup.
+  </p>
+</section>
+
+<!-- ── Latency ── -->
+<section class="qd-card p-5 mb-5">
+  <h2 class="hud-title">API latency <span class="hud-sub">this collection · since startup</span></h2>
+  {% if not latency %}
+  <p class="text-xs text-[#7b8fb5]">No requests recorded for this collection since startup.</p>
+  {% else %}
+  <div class="overflow-x-auto">
+    <table class="qd-table w-full text-xs">
+      <thead><tr>
+        <th class="text-left px-3 py-2">Endpoint</th><th class="text-left px-3 py-2">Status</th>
+        <th class="text-right px-3 py-2">Count</th><th class="text-right px-3 py-2">Avg</th>
+        <th class="text-right px-3 py-2">p95 (est.)</th><th class="text-right px-3 py-2">Max</th>
+      </tr></thead>
+      <tbody>
+      {% for r in latency %}
+      <tr>
+        <td class="px-3 py-2 font-mono text-[#d0dce8] break-all"><span class="text-[#7b8fb5]">{{ r.proto }}{% if r.method %} {{ r.method }}{% endif %}</span> {{ r.endpoint | replace('/collections/{collection_name}', '') }}</td>
+        <td class="px-3 py-2"><span class="badge {{ 'badge-red' if r.failed else 'badge-green' }}">{{ '▲ ' if r.failed }}{{ r.status }}</span></td>
+        <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(r.count) }}</td>
+        {% for v in [r.avg, r.p95, r.max] %}
+        <td class="px-3 py-2 text-right font-mono whitespace-nowrap">{% if v is not none %}{% if v < 1 %}{{ '%.2f' | format(v * 1000) }} ms{% else %}{{ '%.2f' | format(v) }} s{% endif %}{% else %}—{% endif %}</td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+
+<!-- ── Payload indexes ── -->
+<section class="qd-card p-5 mb-5">
+  <h2 class="hud-title">Payload indexes <span class="hud-sub">coverage of {{ '{:,}'.format(points) }} points · top values from /facet</span></h2>
+  {% if not pindex %}
+  <p class="text-xs text-[#7b8fb5]">No payload indexes. Filtered searches will scan payloads; create indexes on fields you filter by.</p>
+  {% else %}
+  <div class="overflow-x-auto">
+    <table class="qd-table w-full text-xs">
+      <thead><tr>
+        <th class="text-left px-3 py-2">Field</th><th class="text-left px-3 py-2">Type</th>
+        <th class="text-left px-3 py-2">Flags</th><th class="text-right px-3 py-2">Points</th>
+        <th class="text-left px-3 py-2 w-40">Coverage</th><th class="text-left px-3 py-2">Top values</th>
+      </tr></thead>
+      <tbody>
+      {% for f in pindex %}
+      {% set hits = facets.get(f.field) or [] %}
+      <tr>
+        <td class="px-3 py-2 font-mono text-[#38bdf8]">{{ f.field }}</td>
+        <td class="px-3 py-2 font-mono">{{ f.type }}</td>
+        <td class="px-3 py-2">{% for fl in f.flags %}<span class="badge badge-blue mr-1">{{ fl }}</span>{% else %}<span class="text-[#7b8fb5]">—</span>{% endfor %}</td>
+        <td class="px-3 py-2 text-right font-mono {% if f.points == 0 %}text-[#fbbf24]{% endif %}">{{ '{:,}'.format(f.points) }}{% if f.points == 0 %} ▲{% endif %}</td>
+        <td class="px-3 py-2">
+          {% if f.coverage is not none %}
+          <div class="flex items-center gap-2">
+            <div class="meter flex-1 {% if f.coverage == 0 %}meter-bad{% elif f.coverage < 100 %}meter-warn{% endif %}"><span style="width: {{ [f.coverage, 100] | min }}%"></span></div>
+            <span class="font-mono w-12 text-right">{{ f.coverage | round(1) }}%</span>
+          </div>
+          {% else %}—{% endif %}
+        </td>
+        <td class="px-3 py-2">
+          {% if hits %}
+          {% set top = hits[0].count or 1 %}
+          <details>
+            <summary class="cursor-pointer text-[#d0dce8]">
+              <span class="font-mono">{{ hits[0].value | trunc(32) }}</span>
+              <span class="text-[#7b8fb5]">{{ '{:,}'.format(hits[0].count) }}{% if points %} · {{ (hits[0].count / points * 100) | round(1) }}%{% endif %}</span>
+              {% if hits | length > 1 %}<span class="text-[#7b8fb5]"> +{{ hits | length - 1 }} more</span>{% endif %}
+            </summary>
+            <div class="mt-2 space-y-1">
+              {% for h in hits %}
+              <div class="grid grid-cols-[1fr_auto] gap-2 items-center">
+                <div class="relative h-5 rounded bg-[#0e1421] overflow-hidden">
+                  <div class="absolute inset-y-0 left-0 bg-[rgba(56,189,248,0.18)] border-r border-[#38bdf8]" style="width: {{ h.count / top * 100 }}%"></div>
+                  <span class="relative px-2 font-mono leading-5 text-[#d0dce8]">{{ h.value | trunc(40) }}</span>
+                </div>
+                <span class="font-mono text-[#7b8fb5] w-20 text-right">{{ '{:,}'.format(h.count) }}</span>
+              </div>
+              {% endfor %}
+            </div>
+          </details>
+          {% elif f.type in ['keyword', 'bool', 'integer'] and f.points %}<span class="text-[#7b8fb5]">facet unavailable</span>
+          {% else %}<span class="text-[#7b8fb5]">—</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="text-[0.6875rem] text-[#7b8fb5] mt-2">Facet counts are approximate (<span class="font-mono">exact=false</span>). Only keyword, bool and integer indexes support faceting.</p>
+  {% endif %}
+</section>
+
+<!-- ── Segments ── -->
+<section class="qd-card p-5 mb-5">
+  <h2 class="hud-title">Segments <span class="hud-sub">{{ segments | length }} on this peer</span></h2>
+  <div class="overflow-x-auto">
+    <table class="qd-table w-full text-xs">
+      <thead><tr>
+        <th class="text-left px-3 py-2">Segment</th><th class="text-left px-3 py-2">Type</th>
+        <th class="text-right px-3 py-2">Points</th><th class="text-right px-3 py-2">Indexed</th>
+        <th class="text-right px-3 py-2">Deleted</th><th class="text-right px-3 py-2">Vectors</th>
+        <th class="text-right px-3 py-2">Payload</th><th class="text-left px-3 py-2">Storage</th>
+      </tr></thead>
+      <tbody>
+      {% for s in segments %}
+      {% set nv = s.num_vectors or 0 %}
+      <tr>
+        <td class="px-3 py-2 font-mono text-[#38bdf8]" title="{{ s.uuid }}">{{ (s.uuid or '')[:8] }}</td>
+        <td class="px-3 py-2">
+          <span class="badge {{ 'badge-green' if s.segment_type == 'indexed' else 'badge-yellow' if nv else '' }}">{{ s.segment_type }}</span>
+          {% if s.is_appendable %}<span class="text-[#7b8fb5] ml-1">appendable</span>{% endif %}
+        </td>
+        <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(s.num_points or 0) }}</td>
+        <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(s.num_indexed_vectors or 0) }}</td>
+        <td class="px-3 py-2 text-right font-mono {% if nv and (s.num_deleted_vectors or 0) / nv > 0.1 %}text-[#fbbf24]{% endif %}">
+          {{ '{:,}'.format(s.num_deleted_vectors or 0) }}{% if nv %} · {{ ((s.num_deleted_vectors or 0) / nv * 100) | round(1) }}%{% endif %}
+        </td>
+        <td class="px-3 py-2 text-right font-mono">{{ s.vectors_size_bytes | bytes }}</td>
+        <td class="px-3 py-2 text-right font-mono">{{ s.payloads_size_bytes | bytes }}</td>
+        <td class="px-3 py-2 font-mono text-[#7b8fb5]">
+          {% for vn, vd in (s.config.vector_data or {}).items() %}{{ vd.storage_type }}{% if not loop.last %}, {% endif %}{% endfor %}
+          {% if s.config.payload_storage_type %} · payload {{ s.config.payload_storage_type.type }}{% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="px-3 py-4 text-[#7b8fb5]">Telemetry returned no segments for this collection on this peer.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<div class="grid grid-cols-1 xl:grid-cols-2 gap-5 mb-5">
+  <!-- ── Search paths ── -->
+  <section class="qd-card p-5">
+    <h2 class="hud-title">Search paths <span class="hud-sub">how searches were executed, summed over segments</span></h2>
+    {% if not search_stats %}
+    <p class="text-xs text-[#7b8fb5]">No searches recorded since startup.</p>
+    {% else %}
+    <table class="qd-table w-full text-xs">
+      <thead><tr>
+        <th class="text-left px-3 py-2">Index</th><th class="text-left px-3 py-2">Path</th>
+        <th class="text-right px-3 py-2">Count</th><th class="text-right px-3 py-2">Avg</th>
+        <th class="text-right px-3 py-2">Max</th>
+      </tr></thead>
+      <tbody>
+      {% for r in search_stats %}
+      <tr>
+        <td class="px-3 py-2 font-mono text-[#38bdf8]">{{ r.index }}</td>
+        <td class="px-3 py-2 font-mono {% if 'plain' in r.kind or 'exact' in r.kind %}text-[#fbbf24]{% endif %}">{{ r.kind }}</td>
+        <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(r.count) }}</td>
+        <td class="px-3 py-2 text-right font-mono">{{ '%.0f' | format(r.avg_us) if r.avg_us is number else '—' }} µs</td>
+        <td class="px-3 py-2 text-right font-mono">{{ '%.0f' | format(r.max_us) }} µs</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="text-[0.6875rem] text-[#7b8fb5] mt-2">Paths containing <span class="font-mono">plain</span> or <span class="font-mono">exact</span> bypass HNSW and scan vectors.</p>
+    {% endif %}
+  </section>
+
+  <!-- ── Optimizer ── -->
+  <section class="qd-card p-5">
+    {% set sm = optimizations.summary or {} %}
+    <h2 class="hud-title">Optimizer <span class="hud-sub">{{ (optimizations.running or []) | length }} running · {{ sm.queued_optimizations or 0 }} queued</span></h2>
+    <dl class="kv mb-4">
+      <dt>Queued segments</dt><dd>{{ sm.queued_segments if sm.queued_segments is number else '—' }}</dd>
+      <dt>Queued points</dt><dd>{{ '{:,}'.format(sm.queued_points) if sm.queued_points is number else '—' }}</dd>
+      <dt>Idle segments</dt><dd>{{ sm.idle_segments if sm.idle_segments is number else '—' }}</dd>
+      <dt>CPU / vector IO r / payload IO r</dt>
+      <dd>{{ '{:,}'.format(hw.cpu) if hw.cpu is number else '—' }} · {{ hw.vector_io_read | bytes }} · {{ hw.payload_io_read | bytes }}</dd>
+    </dl>
+    {% for r in optimizations.running or [] %}
+    <div class="text-xs font-mono text-[#fbbf24] mb-1">▶ {{ r.optimizer or r.name or 'optimization' }} {{ r | tojson | trunc(120) }}</div>
+    {% endfor %}
+    {% if opt_log %}
+    <h3 class="text-xs uppercase tracking-wider text-[#7b8fb5] mt-3 mb-2">Recent optimizations</h3>
+    <ul class="space-y-1 text-xs font-mono">
+      {% for o in opt_log %}
+      <li class="flex justify-between gap-3">
+        <span><span class="{{ 'text-[#4ade80]' if o.status == 'done' else 'text-[#fbbf24]' }}">{{ o.status }}</span> {{ o.name }}</span>
+        <span class="text-[#7b8fb5]">{{ o.start_at }}{% if o.end_at %} → {{ o.end_at[11:19] }}{% endif %}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="text-xs text-[#7b8fb5]">No optimizations since startup.</p>
+    {% endif %}
+  </section>
+</div>
+
+<!-- ── Slow requests ── -->
+<section class="qd-card p-5 mb-5">
+  <h2 class="hud-title">Slow requests <span class="hud-sub">operations over 50 ms on this collection · slowest first</span></h2>
+  {% if not slow_requests %}
+  <p class="text-xs text-[#7b8fb5]">● No operation on this collection took longer than 50 ms since startup.</p>
+  {% else %}
+  {% set show_collection = false %}
+  {% include "partials/slow_requests.html" %}
+  {% endif %}
+</section>

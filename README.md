@@ -66,7 +66,7 @@ git clone https://github.com/tunahanyazar0/QdrantMonitor
 cd QdrantMonitor
 
 uv sync
-uv run qdrant-monitor
+uv run uvicorn app.main:app --host 0.0.0.0 --port 11000 --reload
 ```
 
 The app starts at **http://localhost:11000**.
