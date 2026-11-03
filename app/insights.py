@@ -284,19 +284,37 @@ REPLICA_STATES: dict[str, dict] = {
 }
 
 
+# Qdrant collection/shard status values (collection info docs).
+COLLECTION_STATUS = {
+    "green": "all segments optimized and indexed.",
+    "yellow": "optimizing: segments are being rebuilt or indexed.",
+    "grey": "optimizations are pending and will start on the next update or a manual trigger.",
+    "red": "an operation failed; check optimizer_status and the logs.",
+}
+
+
+def optimizer_error(optimizer_status) -> str | None:
+    if optimizer_status in (None, "ok"):
+        return None
+    if isinstance(optimizer_status, dict):
+        return str(optimizer_status.get("error") or optimizer_status)
+    return str(optimizer_status)
+
+
 def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] | None = None,
-                   cluster_shards: list | None = None) -> dict:
+                   cluster_shards: list | None = None, local_status: dict | None = None) -> dict:
     """views: peer_id -> that peer's GET /collections/{c}/cluster result (None if not reachable).
     remote_stats: viewer peer_id -> telemetry shards[].remote[] (per-replica search/update counters).
     cluster_shards: GET /cluster/telemetry?details_level=3 collections[c].shards, which the connected node
-    gathers from every peer; it fills replicas whose own peer is not reachable directly."""
+    gathers from every peer; it fills replicas whose own peer is not reachable directly.
+    local_status: (shard_id, peer_id) -> green/yellow/grey/red from that peer's own telemetry."""
     remote_stats = remote_stats or {}
     shards: dict[int, dict[str, dict]] = {}
 
     def slot(shard_id, peer):
         return shards.setdefault(shard_id, {}).setdefault(str(peer), {
             "peer": str(peer), "state": None, "points": None, "shard_key": None,
-            "seen": {}, "ops": {}, "source": None,
+            "seen": {}, "ops": {}, "source": None, "status": None,
         })
 
     for viewer, info in views.items():
@@ -318,9 +336,15 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
             if rp.get("peer_id") is None:
                 continue
             r = slot(sh.get("id"), rp.get("peer_id"))
+            r["status"] = r["status"] or rp.get("status")
             if r["state"] is None:
                 r["state"], r["points"] = rp.get("state"), rp.get("num_points")
                 r["source"] = "cluster telemetry"
+
+    for (sid, peer), st in (local_status or {}).items():
+        r = shards.get(sid, {}).get(str(peer))
+        if r is not None and st:
+            r["status"] = st
 
     for viewer, remotes in remote_stats.items():
         for rm in remotes or []:
@@ -361,6 +385,9 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
             for s in bad:
                 lvl = "error" if not REPLICA_STATES.get(s, {}).get("readable") else "warn"
                 findings.append((lvl, f"{label} is {s}: {REPLICA_STATES.get(s, {}).get('meaning', 'unknown state')}"))
+            if r["status"] in ("yellow", "grey", "red"):
+                findings.append(({"red": "error"}.get(r["status"], "info"),
+                                 f"{label} is {r['status']}: {COLLECTION_STATUS.get(r['status'], '')}"))
             if top and r["points"] == 0:
                 findings.append(("error", f"{label} holds 0 points while another replica holds {top:,}."))
             elif r["delta"] and top and abs(r["delta"]) / top > 0.001:
@@ -380,6 +407,36 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
         findings.append(("info", f"No data for peer(s) {', '.join(unreachable)}: their replica state and point counts are not verified."))
     findings.sort(key=lambda f: {"error": 0, "warn": 1}.get(f[0], 2))
     return {"shards": out, "findings": findings, "unreachable": unreachable}
+
+
+_STATUS_RANK = {"red": 3, "grey": 2, "yellow": 1, "green": 0}
+
+
+def peer_summary(matrix: dict) -> dict:
+    """peer -> summary of the replicas that peer holds across all shards of one collection."""
+    out: dict[str, dict] = {}
+    for sh in matrix.get("shards") or []:
+        for r in sh["replicas"]:
+            p = out.setdefault(r["peer"], {"replicas": 0, "active": 0, "points": 0, "points_known": False,
+                                           "worst_state": None, "status": None, "disagree": False,
+                                           "unreadable": 0, "detail": []})
+            st = r.get("consensus_state") or r.get("state")
+            p["replicas"] += 1
+            p["active"] += st == "Active" and not r.get("disagree")
+            if r.get("points") is not None:
+                p["points"] += r["points"]
+                p["points_known"] = True
+            if st and st != "Active" and (p["worst_state"] is None or REPLICA_STATES.get(st, {}).get("readable") is False):
+                p["worst_state"] = st
+            if r.get("status") and _STATUS_RANK.get(r["status"], 0) >= _STATUS_RANK.get(p["status"] or "green", 0):
+                p["status"] = r["status"]
+            p["disagree"] |= bool(r.get("disagree"))
+            p["unreadable"] += r.get("readable") is False
+            pts = f"{r['points']:,}" if r.get("points") is not None else "?"
+            p["detail"].append(f"shard {sh['shard_id']}: {st or 'unknown'} · {pts} points"
+                               + (f" · {r['status']}" if r.get("status") else "")
+                               + (" · peers disagree" if r.get("disagree") else ""))
+    return out
 
 
 def placement(matrix: dict, peers: list[str], replication_factor: int) -> dict:
@@ -559,7 +616,11 @@ def collection_warnings(info: dict, shard_info: dict | None, segments: list,
 
     status = info.get("status")
     if status and status != "green":
-        warns.append(("error" if status == "red" else "warn", f"Collection status is {status}."))
+        warns.append(({"red": "error", "yellow": "info", "grey": "warn"}.get(status, "warn"),
+                      f"Collection status is {status}: {COLLECTION_STATUS.get(status, 'unknown status.')}"))
+    opt_err = optimizer_error(info.get("optimizer_status"))
+    if opt_err:
+        warns.append(("error", f"Optimizer error: {opt_err}"))
 
     for shard in ((shard_info or {}).get("local_shards") or []) + ((shard_info or {}).get("remote_shards") or []):
         if shard.get("state") != "Active":
@@ -802,4 +863,14 @@ if __name__ == "__main__":
     assert sa["rows"][0]["uuid"] == "p1" and sa["rows"][0]["drift"] == []
     i2 = next(r for r in sa["rows"] if r["uuid"] == "i2")
     assert "quantization none (config scalar)" in i2["drift"] and list(i2["payload_indexes"]) == ["cat"]
+    stat = replica_matrix({"a": {"peer_id": "a", "local_shards": [{"shard_id": 0, "points_count": 5, "state": "Active"}]}},
+                          None, [{"id": 0, "replicas": [{"peer_id": "a", "state": "Active", "status": "green"}]}], {(0, "a"): "yellow"})
+    assert stat["shards"][0]["replicas"][0]["status"] == "yellow"
+    assert any("is yellow: optimizing" in m_ for _, m_ in stat["findings"]), stat["findings"]
+    assert optimizer_error("ok") is None and optimizer_error({"error": "disk full"}) == "disk full"
+    ow = collection_warnings({"status": "red", "optimizer_status": {"error": "disk full"}, "config": {}}, None, [], [])
+    assert ("error", "Optimizer error: disk full") in ow and any(l == "error" and "red" in m_ for l, m_ in ow), ow
+    ps = peer_summary(mx6)
+    assert ps["p1"]["replicas"] == 4 and ps["p1"]["worst_state"] == "Dead" and ps["p1"]["unreadable"] == 1
+    assert ps["p3"]["active"] == 3 and ps["p3"]["points"] == 30000 and ps["p3"]["worst_state"] is None
     print("ok")

@@ -67,6 +67,59 @@
 <div class="qd-card p-4 mb-8 text-xs text-[#fbbf24]">▲ No replica data for {{ unmapped | length }} peer(s) from any source. <a href="#peer-endpoints" class="underline">Map endpoints</a>.</div>
 {% endif %}
 
+<!-- ── Replicas ── -->
+{% if collections %}
+<section class="qd-card p-5 mb-8" id="replicas">
+  <h2 class="hud-title">Replicas <span class="hud-sub">every collection's replicas on every peer · state, points and optimizer status</span></h2>
+  <div class="overflow-x-auto">
+    <table class="qd-table w-full text-xs">
+      <thead><tr>
+        <th class="text-left px-3 py-2">Collection</th>
+        <th class="text-left px-3 py-2">Status</th>
+        {% for p in peer_ids %}
+        <th class="text-left px-3 py-2 whitespace-nowrap" title="{{ p }}">
+          …{{ p[-6:] }}{% if p == self_id %} <span class="normal-case text-[#7dd3fc]">this</span>{% endif %}{% if p == leader_id %} <span class="normal-case text-[#f0abfc]">◆ leader</span>{% endif %}
+        </th>
+        {% endfor %}
+      </tr></thead>
+      <tbody>
+      {% for c in collections %}
+      {% set rp = replica_peers.get(c.name, {}) %}
+      <tr>
+        <td class="px-3 py-2 align-top"><a href="/collection/{{ c.name }}" class="font-mono text-[#38bdf8] hover:text-[#00e5a0]">{{ c.name }}</a>
+          <div class="text-[0.6875rem] text-[#94a8c8]">{{ c.shards }} shard{{ 's' if c.shards != 1 }} × RF {{ c.replication }}</div></td>
+        <td class="px-3 py-2 align-top">
+          {% set cs = c.coll_status %}
+          <span class="badge {{ {'green': 'badge-green', 'yellow': 'badge-yellow', 'grey': 'badge-blue', 'red': 'badge-red'}.get(cs, '') }}"
+                title="{{ status_meaning.get(cs, '') }}">{{ '●' if cs == 'green' else '▲' }} {{ cs or 'unknown' }}</span>
+          {% if c.optimizer_error %}<div class="text-[0.6875rem] text-[#f87171] mt-1" title="{{ c.optimizer_error }}">▲ optimizer error</div>{% endif %}
+        </td>
+        {% for p in peer_ids %}
+        {% set v = rp.get(p) %}
+        <td class="px-3 py-2 align-top whitespace-nowrap" title="{{ v.detail | join('\n') if v else 'no replica of this collection on this peer' }}">
+          {% if v %}
+          {% set ok = v.active == v.replicas and not v.disagree %}
+          <div class="flex items-center gap-1.5">
+            <span class="tier {{ 'tier-cached' if ok else 'tier-pinned' }}">{{ '●' if ok else '▲' }}
+              {% if v.replicas > 1 %}{{ v.active }}/{{ v.replicas }} Active{% else %}{{ v.worst_state or ('Active' if ok else 'disputed') }}{% endif %}
+            </span>
+            {% if v.status and v.status != 'green' %}
+            <span class="badge {{ 'badge-red' if v.status == 'red' else ('badge-yellow' if v.status == 'yellow' else 'badge-blue') }}" title="{{ status_meaning.get(v.status, '') }}">{{ v.status }}</span>
+            {% endif %}
+          </div>
+          <div class="font-mono text-[#94a8c8] mt-1">{{ '{:,}'.format(v.points) if v.points_known else '— points' }}{% if v.replicas > 1 and v.worst_state %} <span class="text-[#f87171]">· {{ v.worst_state }}</span>{% endif %}{% if v.disagree %} <span class="text-[#f87171]">· disputed</span>{% endif %}</div>
+          {% else %}<span class="text-[#4b5f82]" aria-label="no replica">·</span>{% endif %}
+        </td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="text-[0.6875rem] text-[#94a8c8] mt-2">Hover a cell for each shard's state, points and status. "·" means the peer holds no replica of that collection. Open a collection for its shard placement grid.</p>
+</section>
+{% endif %}
+
 <!-- ── Resources + Memory ── -->
 <div class="grid grid-cols-1 xl:grid-cols-2 gap-5 mb-8">
   <section class="qd-card p-5">
@@ -326,7 +379,8 @@
   <div class="overflow-x-auto">
     <table class="qd-table w-full text-xs">
       <thead><tr>
-        <th class="text-left px-3 py-2">Collection</th><th class="text-right px-3 py-2">Points</th>
+        <th class="text-left px-3 py-2">Collection</th><th class="text-left px-3 py-2">Status</th>
+        <th class="text-left px-3 py-2">Optimizer</th><th class="text-right px-3 py-2">Points</th>
         <th class="text-left px-3 py-2">Shards × RF</th><th class="text-left px-3 py-2">Replicas</th>
         <th class="text-right px-3 py-2">Disk</th><th class="text-right px-3 py-2">Heap</th>
         <th class="text-right px-3 py-2">Cache warm</th>
@@ -337,6 +391,15 @@
       {% for c in collections %}
       <tr>
         <td class="px-3 py-2"><a href="/collection/{{ c.name }}" class="font-mono text-[#38bdf8] hover:text-[#00e5a0]">{{ c.name }}</a></td>
+        <td class="px-3 py-2">
+          {% set cs = c.coll_status %}
+          <span class="badge {{ {'green': 'badge-green', 'yellow': 'badge-yellow', 'grey': 'badge-blue', 'red': 'badge-red'}.get(cs, '') }}"
+                title="{{ status_meaning.get(cs, '') }}">{{ '●' if cs == 'green' else '▲' }} {{ cs or 'unknown' }}</span>
+        </td>
+        <td class="px-3 py-2 whitespace-nowrap">
+          {% if c.optimizer_error %}<span class="badge badge-red" title="{{ c.optimizer_error }}">▲ error</span>
+          {% elif c.optimizer_known %}<span class="badge badge-green">● ok</span>{% else %}<span class="text-[#94a8c8]">—</span>{% endif %}
+        </td>
         {% set mx = c.replicas %}
         {% set cluster_points = (mx.shards | map(attribute='max_points') | select('number') | sum) if mx and mx.shards else none %}
         <td class="px-3 py-2 text-right font-mono" title="{{ '{:,}'.format(c.points) }} on this peer">

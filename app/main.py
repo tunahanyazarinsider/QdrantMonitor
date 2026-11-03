@@ -1510,12 +1510,15 @@ async def _replica_views(client: httpx.AsyncClient, bases: dict[str, str | None]
         views[pid] = _d(res) if res is not None else None
         if err:
             errors.append(f"peer {pid}: {err}")
-    remote_stats = {}
+    remote_stats, local_status = {}, {}
     for pid, tele in (telemetry or {}).items():
         for c in _d(_d(tele).get("collections")).get("collections") or []:
             if c.get("id") == collection:
                 remote_stats[pid] = [r for s in c.get("shards") or [] for r in s.get("remote") or []]
-    return views, remote_stats, errors
+                for s in c.get("shards") or []:
+                    if _d(s.get("local")).get("status"):
+                        local_status[(s.get("id"), str(pid))] = s["local"]["status"]
+    return views, remote_stats, errors, local_status
 
 
 async def _resolve_peer(client: httpx.AsyncClient, url: str) -> str | None:
@@ -1599,10 +1602,13 @@ async def cluster_page(request: Request):
             )
         tele = _d(tele)
         coll_ids = [c.get("id") for c in _d(tele.get("collections")).get("collections") or [] if c.get("id")]
-        (slow, e10), *mem_results = await asyncio.gather(
+        (slow, e10), *rest = await asyncio.gather(
             _qget(client, "/profiler/slow_requests?limit=20", optional=True),
             *(_qget(client, f"/collections/{quote(cid, safe='')}/memory") for cid in coll_ids),
+            *(_qget(client, f"/collections/{quote(cid, safe='')}") for cid in coll_ids),
         )
+        mem_results, info_results = rest[:len(coll_ids)], rest[len(coll_ids):]
+        info_by_coll = {cid: _d(res) for cid, (res, _) in zip(coll_ids, info_results)}
 
         self_id = str(_d(clus).get("peer_id") or "")
         bases = {str(pid): (_qdrant_base_url() if str(pid) == self_id else conn.peer_urls.get(str(pid)))
@@ -1627,15 +1633,20 @@ async def cluster_page(request: Request):
             bases["local"] = _qdrant_base_url()
         tele_by_peer = {pid: v["telemetry"] for pid, v in peer_live.items()}
         replica_results = await asyncio.gather(*(_replica_views(client, bases, cid, tele_by_peer) for cid in coll_ids))
-    replicas_by_coll = {}
+    replicas_by_coll, replica_peers = {}, {}
     replica_findings = []
     rf_by_coll = {c.get("id"): _d(_d(c.get("config")).get("params")).get("replication_factor") or 1
                   for c in _d(tele.get("collections")).get("collections") or []}
-    for cid, (views, rstats, rerr) in zip(coll_ids, replica_results):
-        mx = insights.replica_matrix(views, rstats, _cluster_shards(cltele, cid))
+    for cid, (views, rstats, rerr, lstatus) in zip(coll_ids, replica_results):
+        mx = insights.replica_matrix(views, rstats, _cluster_shards(cltele, cid), lstatus)
         replicas_by_coll[cid] = mx
+        replica_peers[cid] = insights.peer_summary(mx)
         pl = insights.placement(mx, list(views), rf_by_coll.get(cid, 1))
-        replica_findings += [(lvl, f"{cid}: {msg}") for lvl, msg in mx["findings"] + pl["findings"] if lvl != "info"]
+        status_findings = [w for w in insights.collection_warnings(
+            {k: v for k, v in info_by_coll.get(cid, {}).items() if k in ("status", "optimizer_status")}, None, [], [])
+            if w[1].startswith(("Collection status", "Optimizer error"))]
+        replica_findings += [(lvl, f"{cid}: {msg}") for lvl, msg in status_findings + mx["findings"] + pl["findings"]
+                             if lvl != "info" or msg.startswith("Collection status")]
     replica_findings.sort(key=lambda f: {"error": 0, "warn": 1}.get(f[0], 2))
     # Peers whose replicas no source (direct endpoint or /cluster/telemetry) reported.
     unmapped = sorted({p for mx in replicas_by_coll.values() for p in mx["unreachable"]})
@@ -1688,6 +1699,9 @@ async def cluster_page(request: Request):
             "transfers": len(c.get("transfers") or []),
             "hw": _d(hw.get(c.get("id"))),
             "replicas": replicas_by_coll.get(c.get("id")),
+            "coll_status": info_by_coll.get(c.get("id"), {}).get("status"),
+            "optimizer_error": insights.optimizer_error(info_by_coll.get(c.get("id"), {}).get("optimizer_status")),
+            "optimizer_known": "optimizer_status" in info_by_coll.get(c.get("id"), {}),
             "running_opt": insights.prom_sum(
                 metrics, "collection_running_optimizations", lambda lb, n=c.get("id"): lb.get("id") == n),
         })
@@ -1773,6 +1787,10 @@ async def cluster_page(request: Request):
         "leader_id": leader_id,
         "self_id": self_id,
         "unmapped": unmapped,
+        "peer_ids": sorted(str(p) for p in _d(clus.get("peers"))) or sorted({p for mx in replicas_by_coll.values() for p in
+                                                                              {r["peer"] for sh in mx["shards"] for r in sh["replicas"]}}),
+        "status_meaning": insights.COLLECTION_STATUS,
+        "replica_peers": replica_peers,
         "covered": covered,
         "msg": request.query_params.get("msg", ""),
         "app_info": app_info,
@@ -1881,7 +1899,7 @@ async def collection_health(request: Request, name: str):
         others = {pid: b for pid, b in bases.items() if b and pid != self_id}
         other_tele = await asyncio.gather(*(_qget(client, "/telemetry?details_level=3", base=b) for b in others.values()))
         tele_by_peer = {self_id: _d(tele), **{pid: _d(t) for pid, (t, _) in zip(others, other_tele)}}
-        views, remote_stats, view_errors = await _replica_views(client, bases, name, tele_by_peer)
+        views, remote_stats, view_errors, local_status = await _replica_views(client, bases, name, tele_by_peer)
         cltele = None
         # Covers peers with no endpoint and peers whose endpoint is down or now serves another peer.
         if any(v is None for v in views.values()):
@@ -1912,7 +1930,7 @@ async def collection_health(request: Request, name: str):
 
     errors = [e for e in (e1, e2, e3, e4, e5, e6, e7) if e] + view_errors
     tele = _d(tele)
-    replicas = insights.replica_matrix(views, remote_stats, _cluster_shards(cltele, name))
+    replicas = insights.replica_matrix(views, remote_stats, _cluster_shards(cltele, name), local_status)
     rf = _d(_d(info.get("config")).get("params")).get("replication_factor") or 1
     layout = insights.placement(replicas, list(views), rf)
     raft_leader = str(_d(clus.get("raft_info")).get("leader") or "")
@@ -1966,6 +1984,7 @@ async def collection_health(request: Request, name: str):
         "replication_factor": rf,
         "collection_name": name,
         "states_info": insights.REPLICA_STATES,
+        "status_meaning": insights.COLLECTION_STATUS,
         "shard_info": _d(shard_info),
         "optimizations": _d(opts),
         "opt_log": sorted(opt_log, key=lambda o: o.get("start_at") or "", reverse=True)[:15],

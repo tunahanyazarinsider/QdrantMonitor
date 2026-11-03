@@ -132,6 +132,7 @@
                 title="{{ st }}{% if r.points is number %} · {{ '{:,}'.format(r.points) }} points{% endif %}{% if r.disagree %} · peers disagree{% endif %}">
             {{ '●' if st == 'Active' and not r.disagree else '▲' }} {{ st or 'unknown' }}
           </span>
+          {% if r.status and r.status != 'green' %}<span class="badge ml-1 {{ 'badge-red' if r.status == 'red' else ('badge-yellow' if r.status == 'yellow' else 'badge-blue') }}" title="{{ status_meaning.get(r.status, '') }}">{{ r.status }}</span>{% endif %}
           {% if r.delta %}<span class="font-mono text-[#fbbf24] ml-1">{{ '{:+,}'.format(r.delta) }}</span>{% endif %}
           {% else %}<span class="text-[#4b5f82]">·</span>{% endif %}
         </td>
@@ -203,6 +204,8 @@
             <span class="badge {{ 'badge-green' if st == 'Active' else ('badge-yellow' if states_info.get(st, {}).get('readable') else 'badge-red') }}"
                   title="{{ states_info.get(st, {}).get('meaning', '') }}">{{ '● ' if st == 'Active' else '▲ ' }}{{ st }}</span>
             {% if r.disagree %}<div class="text-[0.6875rem] text-[#f87171] mt-1">▲ disputed by other peers</div>{% endif %}
+            {% if r.status %}<span class="badge mt-1 {{ {'green': 'badge-green', 'yellow': 'badge-yellow', 'grey': 'badge-blue', 'red': 'badge-red'}.get(r.status, '') }}"
+                  title="{{ status_meaning.get(r.status, '') }}">{{ '●' if r.status == 'green' else '▲' }} {{ r.status }}</span>{% endif %}
             {% else %}<span class="text-[#7b8fb5]">unverified</span>{% endif %}
           </td>
           <td class="px-3 py-2 text-right font-mono {% if r.points == 0 and sh.max_points %}text-[#f87171]{% endif %}">
