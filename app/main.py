@@ -450,11 +450,7 @@ async def api_delete_collection(name: str):
 async def dashboard(request: Request):
     if not conn.connected:
         return _render(request, "dashboard.html", {"collections": [], "total_points": 0, "conn": conn, "health": []})
-    state = await _cluster_state(request)
-    for row in state["collections"]:
-        mx = row.get("replicas") or {}
-        row["cluster_points"] = sum(sh["max_points"] for sh in mx.get("shards") or [] if sh["max_points"] is not None) \
-            if mx.get("shards") else row["points"]
+    state = await _cluster_state(request, full=False)
     state["total_points"] = sum(r["cluster_points"] for r in state["collections"])
     return _render(request, "dashboard.html", state)
 
@@ -1466,6 +1462,21 @@ def _cluster_shards(cluster_telemetry, collection: str) -> list | None:
     return _d(entry).get("shards") if isinstance(entry, dict) and "shards" in entry else None
 
 
+def _cluster_vectors(cluster_telemetry, collection: str) -> int | None:
+    """Cluster-wide vector count: per shard, the largest replica's vectors (deleted ones included)."""
+    shards = _cluster_shards(cluster_telemetry, collection)
+    if not shards:
+        return None
+    return sum(max((sum(_d(rp.get("num_vectors_by_name")).values()) for rp in sh.get("replicas") or []), default=0)
+               for sh in shards)
+
+
+def _cluster_points(matrix: dict | None, local_points: int) -> int:
+    shards = (matrix or {}).get("shards") or []
+    known = [sh["max_points"] for sh in shards if sh["max_points"] is not None]
+    return sum(known) if known else local_points
+
+
 def _normalize_url(raw: str) -> str:
     raw = raw.strip().rstrip("/")
     return raw if raw.startswith(("http://", "https://")) else f"http://{raw}"
@@ -1581,8 +1592,13 @@ async def api_peers_discover():
     return RedirectResponse(url=f"/cluster?msg={quote(msg)}", status_code=303)
 
 
-async def _cluster_state(request: Request) -> dict:
-    """Everything the cluster page and the overview show; all Qdrant calls run in parallel."""
+async def _skip():
+    return None, None
+
+
+async def _cluster_state(request: Request, full: bool = True) -> dict:
+    """Everything the cluster page shows; all Qdrant calls run in parallel.
+    full=False (overview page) skips snapshots, the slow-request log and per-peer metrics."""
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=2.0)) as client:
         (tele, e1), (clus, e2), (cltele, e3), (quotas, e4), (issues, e5), (metrics_txt, e6), \
             (healthz, _), (readyz, e8), (snaps, e9) = await asyncio.gather(
@@ -1594,17 +1610,18 @@ async def _cluster_state(request: Request) -> dict:
                 _qget(client, "/metrics", raw=True),
                 _qget(client, "/healthz", raw=True),
                 _qget(client, "/readyz", raw=True),
-                _qget(client, "/snapshots"),
+                _qget(client, "/snapshots") if full else _skip(),
             )
         tele = _d(tele)
         coll_ids = [c.get("id") for c in _d(tele.get("collections")).get("collections") or [] if c.get("id")]
         (slow, e10), *rest = await asyncio.gather(
-            _qget(client, "/profiler/slow_requests?limit=20", optional=True),
+            _qget(client, "/profiler/slow_requests?limit=20", optional=True) if full else _skip(),
             *(_qget(client, f"/collections/{quote(cid, safe='')}/memory") for cid in coll_ids),
             *(_qget(client, f"/collections/{quote(cid, safe='')}") for cid in coll_ids),
         )
         mem_results, info_results = rest[:len(coll_ids)], rest[len(coll_ids):]
         info_by_coll = {cid: _d(res) for cid, (res, _) in zip(coll_ids, info_results)}
+        info_err_by_coll = {cid: err for cid, (_, err) in zip(coll_ids, info_results) if err}
 
         self_id = str(_d(clus).get("peer_id") or "")
         bases = {str(pid): (_qdrant_base_url() if str(pid) == self_id else conn.peer_urls.get(str(pid)))
@@ -1612,7 +1629,7 @@ async def _cluster_state(request: Request) -> dict:
         others = {pid: b for pid, b in bases.items() if b and pid != self_id}
         peer_fetch = await asyncio.gather(*(
             asyncio.gather(_qget(client, "/cluster", base=b), _qget(client, "/telemetry?details_level=3", base=b),
-                           _qget(client, "/metrics", raw=True, base=b))
+                           _qget(client, "/metrics", raw=True, base=b) if full else _skip())
             for b in others.values()
         ))
         peer_live = {self_id: {"cluster": _d(clus), "telemetry": tele, "metrics": metrics_txt or "", "error": None}}
@@ -1630,7 +1647,7 @@ async def _cluster_state(request: Request) -> dict:
         tele_by_peer = {pid: v["telemetry"] for pid, v in peer_live.items()}
         replica_results = await asyncio.gather(*(_replica_views(client, bases, cid, tele_by_peer) for cid in coll_ids))
     replicas_by_coll, replica_peers = {}, {}
-    replica_findings = []
+    replica_triples, status_triples = [], []
     rf_by_coll = {c.get("id"): _d(_d(c.get("config")).get("params")).get("replication_factor") or 1
                   for c in _d(tele.get("collections")).get("collections") or []}
     for cid, (views, rstats, rerr, lstatus) in zip(coll_ids, replica_results):
@@ -1638,12 +1655,11 @@ async def _cluster_state(request: Request) -> dict:
         replicas_by_coll[cid] = mx
         replica_peers[cid] = insights.peer_summary(mx)
         pl = insights.placement(mx, list(views), rf_by_coll.get(cid, 1))
-        status_findings = [w for w in insights.collection_warnings(
-            {k: v for k, v in info_by_coll.get(cid, {}).items() if k in ("status", "optimizer_status")}, None, [], [])
-            if w[1].startswith(("Collection status", "Optimizer error"))]
-        replica_findings += [(lvl, f"{cid}: {msg}") for lvl, msg in status_findings + mx["findings"] + pl["findings"]
-                             if lvl != "info" or msg.startswith("Collection status")]
-    replica_findings.sort(key=lambda f: {"error": 0, "warn": 1}.get(f[0], 2))
+        status_triples += [(cid, lvl, msg) for lvl, msg in insights.status_warnings(info_by_coll.get(cid, {}))]
+        replica_triples += [(cid, lvl, msg) for lvl, msg in mx["findings"] + pl["findings"] if lvl != "info"]
+    rank = {"error": 0, "warn": 1}
+    replica_findings = [(lvl, f"{cid}: {msg}") for cid, lvl, msg in
+                        sorted(status_triples + replica_triples, key=lambda t: rank.get(t[1], 2))]
     # Peers whose replicas no source (direct endpoint or /cluster/telemetry) reported.
     unmapped = sorted({p for mx in replicas_by_coll.values() for p in mx["unreachable"]})
     covered = {r["peer"] for mx in replicas_by_coll.values() for sh in mx["shards"] for r in sh["replicas"]
@@ -1695,11 +1711,12 @@ async def _cluster_state(request: Request) -> dict:
             "transfers": len(c.get("transfers") or []),
             "hw": _d(hw.get(c.get("id"))),
             "replicas": replicas_by_coll.get(c.get("id")),
+            "cluster_points": _cluster_points(replicas_by_coll.get(c.get("id")), sum(l.get("num_points") or 0 for l in local)),
             "coll_status": info_by_coll.get(c.get("id"), {}).get("status"),
-            "info_error": next((e for (r, e), cid2 in zip(info_results, coll_ids) if cid2 == c.get("id") and e), None),
+            "info_error": info_err_by_coll.get(c.get("id")),
             "indexed_vectors": info_by_coll.get(c.get("id"), {}).get("indexed_vectors_count"),
             "segments_count": info_by_coll.get(c.get("id"), {}).get("segments_count"),
-            "vectors_total": sum(nbyname.values()) if nbyname else None,
+            "vectors_total": _cluster_vectors(cltele, c.get("id")) or (sum(nbyname.values()) if nbyname else None),
             "vec_names": [
                 {"name": n or "(default)", "size": _d(v).get("size"), "distance": _d(v).get("distance")}
                 for n, v in (({"": cfg_params.get("vectors")} if "size" in _d(cfg_params.get("vectors"))
@@ -1775,18 +1792,22 @@ async def _cluster_state(request: Request) -> dict:
          (f"{len(live_rafts)}/{len(peers) or 1} checked, agree" if len(live_rafts) > 1 else "only this peer checked")
          if len(leaders) <= 1 and len(terms) <= 1
          else f"leaders {sorted(map(str, leaders))} · terms {sorted(map(str, terms))}"),
-        ("replicas", not any(lvl == "error" for lvl, _ in replica_findings),
+        ("collections", not any(lvl == "error" for _, lvl, _ in status_triples),
          ", ".join(x for x in (
-             f"{sum(1 for lvl, _ in replica_findings if lvl == 'error')} error(s)",
-             f"{sum(1 for lvl, _ in replica_findings if lvl == 'warn')} warning(s)",
+             f"{len({cid for cid, lvl, m in status_triples if m.startswith('Collection status')})} not green",
+             f"{sum(1 for _, _, m in status_triples if m.startswith('Optimizer error'))} optimizer error(s)",
+         ) if not x.startswith("0 ")) or f"{len(coll_rows)} green"),
+        ("replicas", not any(lvl == "error" for _, lvl, _ in replica_triples),
+         ", ".join(x for x in (
+             f"{sum(1 for _, lvl, _ in replica_triples if lvl == 'error')} error(s)",
+             f"{sum(1 for _, lvl, _ in replica_triples if lvl == 'warn')} warning(s)",
              f"{len(unmapped)} peer(s) unverified" if unmapped else "",
          ) if x and not x.startswith("0 "))
          or "ok"),
     ]
 
     for row in coll_rows:
-        tag = f"{row['name']}: "
-        mine = [lvl for lvl, msg in replica_findings if msg.startswith(tag)]
+        mine = [lvl for cid, lvl, _ in status_triples + replica_triples if cid == row["name"]]
         row["errors"], row["warnings"] = mine.count("error"), mine.count("warn")
 
     snap_list = snaps if isinstance(snaps, list) else []
@@ -1846,7 +1867,7 @@ async def cluster_sample():
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=2.0)) as client:
             resp = await client.get(f"{_qdrant_base_url()}/metrics")
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
         return JSONResponse({"error": f"Qdrant at {where} unreachable: {type(exc).__name__}: {exc}"}, status_code=503)
     if resp.status_code >= 400:
         return JSONResponse({"error": f"Qdrant at {where} answered HTTP {resp.status_code}"}, status_code=502)
@@ -1916,7 +1937,11 @@ async def collection_health(request: Request, name: str):
         self_id = str(clus.get("peer_id") or "")
         others = {pid: b for pid, b in bases.items() if b and pid != self_id}
         other_tele = await asyncio.gather(*(_qget(client, "/telemetry?details_level=3", base=b) for b in others.values()))
-        tele_by_peer = {self_id: _d(tele), **{pid: _d(t) for pid, (t, _) in zip(others, other_tele)}}
+        tele_by_peer = {self_id: _d(tele)}
+        for pid, (t, _) in zip(others, other_tele):
+            served = str(_d(_d(_d(t).get("cluster")).get("status")).get("peer_id") or "")
+            if not served or served == pid:
+                tele_by_peer[pid] = _d(t)
         views, remote_stats, view_errors, local_status = await _replica_views(client, bases, name, tele_by_peer)
         cltele = None
         # Covers peers with no endpoint and peers whose endpoint is down or now serves another peer.

@@ -214,7 +214,7 @@ document.getElementById('migrate-form')?.addEventListener('submit', async functi
   <p class="text-sm text-[#4b5f82]">{{ conn.error or 'Check host and port in the top bar' }}</p>
 </div>
 
-{% elif collections | length == 0 %}
+{% elif collections | length == 0 and not errors %}
 <!-- ── Empty state ── -->
 <div class="qd-card p-12 text-center">
   <div class="mx-auto mb-4 w-12 h-12 rounded-full bg-[rgba(0,229,160,0.08)] flex items-center justify-center">

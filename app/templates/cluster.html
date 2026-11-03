@@ -401,7 +401,7 @@
           {% elif c.optimizer_known %}<span class="badge badge-green">● ok</span>{% else %}<span class="text-[#94a8c8]">—</span>{% endif %}
         </td>
         {% set mx = c.replicas %}
-        {% set cluster_points = (mx.shards | map(attribute='max_points') | select('number') | sum) if mx and mx.shards else none %}
+        {% set cluster_points = c.cluster_points %}
         <td class="px-3 py-2 text-right font-mono" title="{{ '{:,}'.format(c.points) }} on this peer">
           {{ '{:,}'.format(cluster_points if cluster_points is not none else c.points) }}
           {% if cluster_points is not none and cluster_points != c.points %}<div class="text-[0.6875rem] text-[#fbbf24]">▲ {{ '{:,}'.format(c.points) }} here</div>{% endif %}

@@ -301,6 +301,18 @@ def optimizer_error(optimizer_status) -> str | None:
     return str(optimizer_status)
 
 
+def status_warnings(info: dict) -> list[tuple[str, str]]:
+    out = []
+    status = info.get("status")
+    if status and status != "green":
+        out.append(({"red": "error", "yellow": "info", "grey": "warn"}.get(status, "warn"),
+                    f"Collection status is {status}: {COLLECTION_STATUS.get(status, 'unknown status.')}"))
+    opt_err = optimizer_error(info.get("optimizer_status"))
+    if opt_err:
+        out.append(("error", f"Optimizer error: {opt_err}"))
+    return out
+
+
 def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] | None = None,
                    cluster_shards: list | None = None, local_status: dict | None = None) -> dict:
     """views: peer_id -> that peer's GET /collections/{c}/cluster result (None if not reachable).
@@ -337,7 +349,7 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
                 continue
             r = slot(sh.get("id"), rp.get("peer_id"))
             r["status"] = r["status"] or rp.get("status")
-            if r["state"] is None:
+            if r["state"] is None and rp.get("state"):
                 r["state"], r["points"] = rp.get("state"), rp.get("num_points")
                 r["source"] = "cluster telemetry"
 
@@ -614,13 +626,7 @@ def collection_warnings(info: dict, shard_info: dict | None, segments: list,
     opt = cfg.get("optimizer_config") or {}
     points = info.get("points_count") or 0
 
-    status = info.get("status")
-    if status and status != "green":
-        warns.append(({"red": "error", "yellow": "info", "grey": "warn"}.get(status, "warn"),
-                      f"Collection status is {status}: {COLLECTION_STATUS.get(status, 'unknown status.')}"))
-    opt_err = optimizer_error(info.get("optimizer_status"))
-    if opt_err:
-        warns.append(("error", f"Optimizer error: {opt_err}"))
+    warns += status_warnings(info)
 
     for shard in ((shard_info or {}).get("local_shards") or []) + ((shard_info or {}).get("remote_shards") or []):
         if shard.get("state") != "Active":
@@ -875,4 +881,8 @@ if __name__ == "__main__":
     assert ps["p3"]["active"] == 3 and ps["p3"]["points"] == 30000 and ps["p3"]["worst_state"] is None
     part_idx = segment_analysis([seg("pi", "indexed", 30000, 29000)], seg_cfg)
     assert not part_idx["rows"][0]["over_threshold"] and round(part_idx["rows"][0]["plain_kib"]) == 1000
+    nostate = replica_matrix({"a": {"peer_id": "a", "local_shards": [], "remote_shards": [{"shard_id": 0, "peer_id": "b", "state": "Dead"}]}, "b": None},
+                             None, [{"id": 0, "replicas": [{"peer_id": "b", "num_points": 5}]}])
+    assert nostate["shards"][0]["replicas"][0]["source"] is None
+    assert status_warnings({"status": "green", "optimizer_status": "ok"}) == []
     print("ok")
