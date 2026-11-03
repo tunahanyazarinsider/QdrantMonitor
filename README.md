@@ -1,6 +1,6 @@
 # Qdrant Monitor
 
-A local dashboard for monitoring, browsing, and visualizing Qdrant vector database collections. Built with FastAPI, HTMX, D3.js, and Plotly — no build step required.
+A local dashboard for monitoring Qdrant clusters and for browsing, visualizing and managing collections. Built with FastAPI, HTMX, D3.js, and Plotly — no build step required.
 
 <img width="1452" height="800" alt="Dashboard" src="https://github.com/user-attachments/assets/280c62fc-1cce-4e48-a487-a318df42a77f" />
 
@@ -13,6 +13,31 @@ A local dashboard for monitoring, browsing, and visualizing Qdrant vector databa
 <img width="1465" alt="HNSW Graph visualization" src="docs/hnsw_graph.png" />
 
 ## Features
+
+### Cluster page (`/cluster`)
+- **Health strip** — leader, `healthz` / `readyz`, open issues, consensus thread, recovery mode, quotas, version skew, raft agreement across peers, replica errors
+- **Resources** — RAM, disk, CPU, file descriptors and mmaps against their limits
+- **Memory** — allocator breakdown (allocated / active / resident / retained) and measured collection memory from `/collections/{name}/memory`: heap, page cache, expected cache, warm %, and a RAM budget (heap + expected cache vs RAM)
+- **Live charts** — memory, requests/s and failures/s, major page faults/s, sampled from `/metrics` every 5 s; backs off when Qdrant is unreachable
+- **Consensus & peers** — raft term, commit and pending ops; every peer's own view of role, leader, term and commit; RAM and collection count per peer
+- **Collections** — cluster-wide point count, readable replicas, disk / heap / cache warmth, memory tiers, optimizations, CPU and IO counters
+- **API latency** — per endpoint count, avg, p95 (from histogram buckets) and max
+- **Slow requests** — operations over 50 ms from `/profiler/slow_requests`, with request bodies
+
+### Multi-peer view
+Peer URIs reported by `/cluster` are cluster-internal. Map each peer to a URL the app can reach (for example a `kubectl port-forward`) under **Peer endpoints**, or click **Scan** to probe ±20 ports on the connected host. Each URL is checked with `GET /cluster` and kept only if its peer id belongs to the cluster; a URL that now serves another peer is flagged instead of shown under the wrong id.
+
+### Collection health tab
+- **Findings** — rule-based checks: replica state disagreement between peers, non-readable replicas (`ManualRecovery`, `Dead`, …), replicas with diverging point counts, failed forwarded updates, payload indexes that cover 0 points (with their disk cost), cold working set, `m=0` full-scan warning, near-vacuum segments
+- **Memory** — per component (vectors, HNSW index, quantized, payload, each payload index, ID tracker): tier, disk, heap, page cache, expected cache, warm %
+- **Replicas** — every replica's own state and point count read from the peer that holds it, Δ vs the largest replica, how each other peer sees it, and forwarded update/search counters
+- **API latency** for this collection, **payload index coverage** with top facet values, **segments**, **search paths** (HNSW vs plain/exact), **optimizer** queue and log, **slow requests**
+
+### Collection management
+- Create and delete collections
+- Create a collection from an uploaded snapshot
+- Migrate points from another Qdrant instance
+- Snapshots tab: create, list, download, save to a path, delete
 
 ### Collections dashboard
 - Overview of all collections — point counts, indexed vectors, indexing %, segment count, shard count
@@ -62,7 +87,7 @@ Real graph built from actual vectors using the collection's index config (M, dis
 ## Setup
 
 ```bash
-git clone https://github.com/tunahanyazar0/QdrantMonitor
+git clone https://github.com/tunahanyazarinsider/QdrantMonitor
 cd QdrantMonitor
 
 uv sync
@@ -72,6 +97,18 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 11000 --reload
 The app starts at **http://localhost:11000**.
 
 Enter your Qdrant host and port in the top bar and click **Connect** (defaults to `localhost:6333`).
+
+## Version notes
+
+- Qdrant 1.18+ is needed for measured per-component memory; older servers fall back to tiers derived from config.
+- Qdrant before 1.19 reports the host machine's RAM and cores in telemetry, not the container limit; the Resources panel labels these as host values.
+- `/quotas` exists from 1.19 and `/profiler/slow_requests` from 1.16; panels for missing endpoints stay empty.
+
+## Checks
+
+```bash
+python3 app/insights.py   # assert-based self-check of the metrics, memory and replica logic
+```
 
 ## Running Qdrant locally
 
@@ -83,7 +120,7 @@ docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant:latest
 
 | Layer | Libraries |
 |-------|-----------|
-| Backend | FastAPI, Jinja2, qdrant-client ≥ 1.17 |
+| Backend | FastAPI, Jinja2, httpx, qdrant-client ≥ 1.17 |
 | Frontend | Tailwind CSS (CDN), HTMX, D3.js v7, Plotly.js |
 | Visualization | D3 force simulation, numpy SVD (PCA) |
 | Package manager | uv |
