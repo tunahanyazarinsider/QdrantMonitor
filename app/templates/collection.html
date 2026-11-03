@@ -386,8 +386,8 @@
 <!-- ── Tab: Health ── -->
 <div id="tab-health" class="tab-panel">
   <div class="flex items-center gap-3 mb-4">
-    <button class="qd-btn-ghost text-xs py-1.5"
-            hx-get="/api/{{ collection.name }}/health"
+    <button class="qd-btn-ghost text-xs py-1.5" id="health-refresh"
+            hx-get="/api/{{ collection.name | urlencode }}/health"
             hx-target="#health-content"
             hx-swap="innerHTML"
             hx-indicator="#health-spinner">Refresh</button>
@@ -397,7 +397,7 @@
        hx-get="/api/{{ collection.name }}/health"
        hx-trigger="load"
        hx-swap="innerHTML">
-    <div class="flex flex-col items-center gap-3 py-16 text-xs text-[#7b8fb5]"><div class="qd-spinner"></div>Reading telemetry, shard state and facets…</div>
+    <div class="flex flex-col items-center gap-3 py-16 text-xs text-[#7b8fb5]"><div class="qd-spinner"></div>Reading collection info, shard state and facets…</div>
   </div>
 </div>
 

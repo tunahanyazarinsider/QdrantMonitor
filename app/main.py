@@ -448,14 +448,94 @@ async def api_delete_collection(name: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
+    empty = {"names": [], "conn": conn, "health": [], "errors": []}
     if not conn.connected:
-        return _render(request, "dashboard.html", {"collections": [], "total_points": 0, "conn": conn, "health": []})
-    state = await _cluster_state(request, full=False)
-    if state["unreachable"]:
-        conn.connected, conn.error = False, state["errors"][0] if state["errors"] else "Qdrant unreachable"
-        return _render(request, "dashboard.html", {"collections": [], "total_points": 0, "conn": conn, "health": []})
-    state["total_points"] = sum(r["cluster_points"] for r in state["collections"])
-    return _render(request, "dashboard.html", state)
+        return _render(request, "dashboard.html", empty)
+    # Only endpoints that skip Qdrant's telemetry collector: on large clusters /telemetry and /metrics take minutes.
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=2.0)) as client:
+        (listed, e1), (clus, e2), (root, _), (healthz, _), (readyz, e5), (issues, e6) = await asyncio.gather(
+            _qget(client, "/collections"),
+            _qget(client, "/cluster"),
+            _qget(client, "/", raw=True),
+            _qget(client, "/healthz", raw=True),
+            _qget(client, "/readyz", raw=True),
+            _qget(client, "/issues"),
+        )
+    if e1 and e2 and all("ConnectError" in e or "ConnectTimeout" in e for e in (e1, e2)):
+        conn.connected, conn.error = False, e1
+        return _render(request, "dashboard.html", empty)
+    try:
+        version = json.loads(root or "{}").get("version")
+    except ValueError:
+        version = None
+    clus = _d(clus)
+    self_id = str(clus.get("peer_id") or "")
+    bases = {str(p): (_qdrant_base_url() if str(p) == self_id else conn.peer_urls.get(str(p))) for p in _d(clus.get("peers"))}
+    return _render(request, "dashboard.html", {
+        "conn": conn,
+        "names": [c.get("name") for c in _d(listed).get("collections") or [] if c.get("name")],
+        "health": _base_health(clus, healthz, readyz, e5, issues, self_id, bases),
+        "peer_count": len(bases) or 1,
+        "version": version,
+        "errors": [e for e in (e1, e2, e5, e6) if e],
+    })
+
+
+def _overview_row(name: str, info, view, info_err, view_err, peers: list[str]) -> dict:
+    info = _d(info)
+    params = _d(_d(info.get("config")).get("params"))
+    vecs = insights.vector_configs(params)
+    points = info.get("points_count")
+    mx = insights.replica_matrix({"self": view}) if isinstance(view, dict) else None
+    findings = insights.status_warnings(info)
+    if mx:
+        findings += mx["findings"] + insights.placement(mx, peers, params.get("replication_factor") or 1)["findings"]
+    levels = [lvl for lvl, _ in findings]
+    return {
+        "name": name,
+        "info_error": info_err,
+        "view_error": view_err,
+        "coll_status": info.get("status"),
+        "optimizer_error": insights.optimizer_error(info.get("optimizer_status")),
+        "optimizer_known": "optimizer_status" in info,
+        "points": points if isinstance(points, int) else None,
+        "vec_names": [{"name": n or "(default)", "size": v.get("size"), "distance": v.get("distance")} for n, v in vecs.items()],
+        "sparse_names": list(_d(params.get("sparse_vectors"))),
+        "replicas": mx,
+        "shards": params.get("shard_number") or 1,
+        "replication": params.get("replication_factor") or 1,
+        "transfers": len(_d(view).get("shard_transfers") or []),
+        # Vectors per point times dense vector names; deleted vectors not yet vacuumed are not counted.
+        "vectors_est": points * len(vecs) if isinstance(points, int) and vecs else None,
+        "indexed_vectors": info.get("indexed_vectors_count"),
+        "segments_count": info.get("segments_count"),
+        "errors": levels.count("error") + bool(info_err) + bool(view_err),
+        "warnings": levels.count("warn"),
+    }
+
+
+@app.get("/api/overview/rows", response_class=HTMLResponse)
+async def overview_rows(request: Request):
+    if not conn.connected:
+        return HTMLResponse("<p class='text-red-400 p-4 text-xs'>Not connected</p>")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=2.0, pool=300.0),
+                                 limits=httpx.Limits(max_connections=16)) as client:
+        (listed, e1), (clus, _) = await asyncio.gather(_qget(client, "/collections"), _qget(client, "/cluster"))
+        names = sorted(c.get("name") for c in _d(listed).get("collections") or [] if c.get("name"))
+        results = await asyncio.gather(*(
+            asyncio.gather(_qget(client, f"/collections/{quote(n, safe='')}"),
+                           _qget(client, f"/collections/{quote(n, safe='')}/cluster"))
+            for n in names
+        ))
+    peers = sorted(str(p) for p in _d(_d(clus).get("peers")))
+    rows = [_overview_row(n, info, view, ie, ve, peers) for n, ((info, ie), (view, ve)) in zip(names, results)]
+    rows.sort(key=lambda r: (-r["errors"], -r["warnings"], r["name"]))
+    return _render(request, "partials/overview_rows.html", {
+        "rows": rows,
+        "errors": [e1] if e1 else [],
+        "total_points": sum(r["points"] or 0 for r in rows),
+        "status_meaning": insights.COLLECTION_STATUS,
+    })
 
 
 @app.get("/collection/{name}", response_class=HTMLResponse)
@@ -1598,27 +1678,64 @@ async def api_peers_discover():
     return RedirectResponse(url=f"/cluster?msg={quote(msg)}", status_code=303)
 
 
+def _base_health(clus: dict, healthz, readyz, readyz_err, issues, self_id: str, bases: dict) -> list:
+    """Health cells that need only /cluster, /healthz, /readyz and /issues."""
+    raft = _d(clus.get("raft_info"))
+    leader_id = str(raft.get("leader", "")) if raft.get("leader") is not None else ""
+    leader_ep = bases.get(leader_id) if leader_id else None
+    standalone = clus.get("status") == "disabled"
+    consensus = _d(clus.get("consensus_thread_status")).get("consensus_thread_status")
+    return [
+        ("leader", bool(leader_id) or standalone,
+         "standalone (cluster mode disabled)" if standalone else
+         (("this peer · " if leader_id == self_id else "") + f"…{leader_id[-6:]}"
+          + (f" · {leader_ep.replace('http://', '')}" if leader_ep else "")
+          + f" · term {raft.get('term')}") if leader_id else "no leader elected"),
+        ("healthz", healthz is not None and "passed" in healthz, (healthz or "unreachable").strip()),
+        ("readyz", not readyz_err, (readyz or readyz_err or "").strip()),
+        ("issues", issues is not None and not _d(issues).get("issues"),
+         f"{len(_d(issues).get('issues') or [])} open" if issues is not None else "unknown (/issues unavailable)"),
+        ("consensus", consensus in (None, "working"), consensus or "n/a"),
+    ]
+
+
 async def _skip():
     return None, None
 
 
-async def _cluster_state(request: Request, full: bool = True) -> dict:
-    """Everything the cluster page shows; all Qdrant calls run in parallel.
-    full=False (overview page) skips snapshots, the slow-request log and per-peer metrics."""
+# Qdrant serves /telemetry, /cluster/telemetry and /metrics from one locked collector, so these calls
+# queue behind each other (and behind Prometheus scrapes); cap each one server-side and never overlap them.
+TELEMETRY_TIMEOUT_S = 20
+
+
+async def _telemetry_chain(client: httpx.AsyncClient, base: str | None = None, cluster: bool = True,
+                           metrics: bool = True):
+    t = f"timeout={TELEMETRY_TIMEOUT_S}"
+    tele = await _qget(client, f"/telemetry?details_level=3&{t}", base=base)
+    if tele[1] and "time" in tele[1].lower():
+        # The collector is that slow right now; the next calls would wait just as long for the same lock.
+        skipped = (None, f"skipped after {tele[1]}")
+        return tele, skipped if cluster else (None, None), skipped if metrics else (None, None)
+    cltele = await _qget(client, f"/cluster/telemetry?details_level=3&{t}", base=base, optional=True) \
+        if cluster else (None, None)
+    metrics_txt = await _qget(client, f"/metrics?{t}", raw=True, base=base) if metrics else (None, None)
+    return tele, cltele, metrics_txt
+
+
+async def _cluster_state(request: Request) -> dict:
+    """Everything the cluster page shows. Cheap calls run in parallel; telemetry calls run one at a time."""
     # Many collections x peers fan out here; cap open connections and let the rest wait in the pool.
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=2.0, pool=120.0),
+    async with httpx.AsyncClient(timeout=httpx.Timeout(TELEMETRY_TIMEOUT_S + 5.0, connect=2.0, pool=120.0),
                                  limits=httpx.Limits(max_connections=16)) as client:
-        (tele, e1), (clus, e2), (cltele, e3), (quotas, e4), (issues, e5), (metrics_txt, e6), \
+        ((tele, e1), (cltele, e3), (metrics_txt, e6)), (clus, e2), (quotas, e4), (issues, e5), \
             (healthz, _), (readyz, e8), (snaps, e9) = await asyncio.gather(
-                _qget(client, "/telemetry?details_level=3"),
+                _telemetry_chain(client),
                 _qget(client, "/cluster"),
-                _qget(client, "/cluster/telemetry?details_level=3", optional=True),
                 _qget(client, "/quotas", optional=True),
                 _qget(client, "/issues"),
-                _qget(client, "/metrics", raw=True),
                 _qget(client, "/healthz", raw=True),
                 _qget(client, "/readyz", raw=True),
-                _qget(client, "/snapshots") if full else _skip(),
+                _qget(client, "/snapshots"),
             )
         tele = _d(tele)
         coll_ids = [c.get("id") for c in _d(tele.get("collections")).get("collections") or [] if c.get("id")]
@@ -1626,7 +1743,7 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
             listed, _ = await _qget(client, "/collections")
             coll_ids = [c.get("name") for c in _d(listed).get("collections") or [] if c.get("name")]
         (slow, e10), *rest = await asyncio.gather(
-            _qget(client, "/profiler/slow_requests?limit=20", optional=True) if full else _skip(),
+            _qget(client, "/profiler/slow_requests?limit=20", optional=True),
             *(_qget(client, f"/collections/{quote(cid, safe='')}/memory") for cid in coll_ids),
             *(_qget(client, f"/collections/{quote(cid, safe='')}") for cid in coll_ids),
         )
@@ -1641,16 +1758,13 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
         self_id = str(_d(clus).get("peer_id") or "")
         bases = {str(pid): (_qdrant_base_url() if str(pid) == self_id else conn.peer_urls.get(str(pid)))
                  for pid in _d(_d(clus).get("peers"))}
-        if not full:
-            bases = {pid: (b if pid == self_id else None) for pid, b in bases.items()}
         others = {pid: b for pid, b in bases.items() if b and pid != self_id}
         peer_fetch = await asyncio.gather(*(
-            asyncio.gather(_qget(client, "/cluster", base=b), _qget(client, "/telemetry?details_level=3", base=b),
-                           _qget(client, "/metrics", raw=True, base=b) if full else _skip())
+            asyncio.gather(_qget(client, "/cluster", base=b), _telemetry_chain(client, base=b, cluster=False))
             for b in others.values()
         ))
         peer_live = {self_id: {"cluster": _d(clus), "telemetry": tele, "metrics": metrics_txt or "", "error": None}}
-        for pid, ((pc, pe1), (pt, pe2), (pm, pe3)) in zip(others, peer_fetch):
+        for pid, ((pc, pe1), ((pt, pe2), _, (pm, pe3))) in zip(others, peer_fetch):
             got = str(_d(pc).get("peer_id") or "")
             if got and got != pid:
                 # Port-forwards get reshuffled; never show another peer's data under this id.
@@ -1790,19 +1904,7 @@ async def _cluster_state(request: Request, full: bool = True) -> dict:
     terms = {r.get("term") for r in live_rafts if r.get("term") is not None}
     quota_exceeded = {k: v for k, v in _d(_d(tele.get("quota")).get("exceeded")).items() if v}
     leader_id = str(raft.get("leader", "")) if raft.get("leader") is not None else ""
-    leader_ep = bases.get(leader_id) if leader_id else None
-    standalone = clus.get("status") == "disabled"
-    health = [
-        ("leader", bool(leader_id) or standalone,
-         "standalone (cluster mode disabled)" if standalone else
-         (("this peer · " if leader_id == self_id else "") + f"…{leader_id[-6:]}"
-          + (f" · {leader_ep.replace('http://', '')}" if leader_ep else "")
-          + f" · term {raft.get('term')}") if leader_id else "no leader elected"),
-        ("healthz", healthz is not None and "passed" in healthz, (healthz or "unreachable").strip()),
-        ("readyz", not e8, (readyz or e8 or "").strip()),
-        ("issues", not (issues or {}).get("issues"), f"{len((issues or {}).get('issues') or [])} open"),
-        ("consensus", _d(clus.get("consensus_thread_status")).get("consensus_thread_status") in (None, "working"),
-         _d(clus.get("consensus_thread_status")).get("consensus_thread_status") or "n/a"),
+    health = _base_health(clus, healthz, readyz, e8, issues, self_id, bases) + [
         ("recovery mode", not _d(app_info.get("features")).get("recovery_mode"),
          "on" if _d(app_info.get("features")).get("recovery_mode") else "off"),
         ("quota", not quota_exceeded, ", ".join(quota_exceeded) + " exceeded" if quota_exceeded else "ok"),
@@ -1882,18 +1984,25 @@ async def cluster_page(request: Request):
     return _render(request, "cluster.html", await _cluster_state(request))
 
 
+SAMPLE_TIMEOUT_S = 5
+
+
 @app.get("/api/cluster/sample")
 async def cluster_sample():
     # Report what Qdrant answers right now; connection state is owned by connect() and the page routes.
     where = f"{conn.host}:{conn.port}"
+    started = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=2.0)) as client:
-            resp = await client.get(f"{_qdrant_base_url()}/metrics")
+        async with httpx.AsyncClient(timeout=httpx.Timeout(SAMPLE_TIMEOUT_S + 5.0, connect=2.0)) as client:
+            resp = await client.get(f"{_qdrant_base_url()}/metrics?timeout={SAMPLE_TIMEOUT_S}")
+        elapsed = time.monotonic() - started
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
-        return JSONResponse({"error": f"Qdrant at {where} unreachable: {type(exc).__name__}: {exc}"}, status_code=503)
+        return JSONResponse({"error": f"Qdrant at {where} unreachable: {type(exc).__name__}: {exc}",
+                             "elapsed": round(time.monotonic() - started, 2)}, status_code=503)
     if resp.status_code >= 400:
-        return JSONResponse({"error": f"Qdrant at {where} answered HTTP {resp.status_code}"}, status_code=502)
-    return {"ts": time.time(), **insights.sample(insights.parse_prom(resp.text))}
+        return JSONResponse({"error": f"Qdrant at {where} answered HTTP {resp.status_code}",
+                             "elapsed": round(elapsed, 2)}, status_code=502)
+    return {"ts": time.time(), "elapsed": round(elapsed, 2), **insights.sample(insights.parse_prom(resp.text))}
 
 
 def _local_segments(telemetry: dict, collection: str) -> list:
@@ -1909,7 +2018,7 @@ async def collection_segments(request: Request, name: str, peer: str = Query("")
     if not conn.connected:
         return HTMLResponse("<p class='text-red-400 p-4 text-xs'>Not connected</p>")
     q = quote(name, safe="")
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=2.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(TELEMETRY_TIMEOUT_S + 5.0, connect=2.0)) as client:
         clus, bases = await _peer_bases(client)
         self_id = str(clus.get("peer_id") or "")
         base = bases.get(peer) if peer else _qdrant_base_url()
@@ -1918,7 +2027,7 @@ async def collection_segments(request: Request, name: str, peer: str = Query("")
         # ponytail: level 6 telemetry covers every collection on that peer; fine for a handful of collections.
         (info, e1), (tele, e2), (who, _) = await asyncio.gather(
             _qget(client, f"/collections/{q}"),
-            _qget(client, "/telemetry?details_level=6", base=base),
+            _qget(client, f"/telemetry?details_level=6&timeout={TELEMETRY_TIMEOUT_S}", base=base),
             _qget(client, "/cluster", base=base),
         )
     served = str(_d(who).get("peer_id") or "")
@@ -1938,37 +2047,41 @@ async def collection_segments(request: Request, name: str, peer: str = Query("")
 
 
 @app.get("/api/{name}/health", response_class=HTMLResponse)
-async def collection_health(request: Request, name: str):
+async def collection_health(request: Request, name: str, deep: bool = Query(False)):
+    """deep=False reads only per-collection endpoints. deep=True adds telemetry and /metrics, which on a
+    large cluster take minutes because neither can be filtered to one collection."""
     if not conn.connected:
         return HTMLResponse("<p class='text-red-400 p-4 text-xs'>Not connected</p>")
     q = quote(name, safe="")
-    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=2.0)) as client:
-        # ponytail: telemetry has no per-collection filter, so level 6 pulls every collection's segments; fine for a handful of collections.
-        (info, e1), (shard_info, e2), (opts, e3), (tele, e4), (mem, e5), (metrics_txt, e6), (slow, e7) = \
+    t = f"timeout={TELEMETRY_TIMEOUT_S}"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(TELEMETRY_TIMEOUT_S + 5.0, connect=2.0)) as client:
+        (info, e1), (shard_info, e2), (opts, e3), (mem, e5), (slow, e7), (clus, bases) = \
             await asyncio.gather(
                 _qget(client, f"/collections/{q}"),
                 _qget(client, f"/collections/{q}/cluster"),
                 _qget(client, f"/collections/{q}/optimizations"),
-                _qget(client, "/telemetry?details_level=6"),
                 _qget(client, f"/collections/{q}/memory", optional=True),
-                _qget(client, "/metrics?per_collection=true", raw=True),
                 # ponytail: endpoint has no collection filter; 100 covers 32-per-type capacity for the common types.
                 _qget(client, "/profiler/slow_requests?limit=100", optional=True),
+                _peer_bases(client),
             )
-        clus, bases = await _peer_bases(client)
         self_id = str(clus.get("peer_id") or "")
-        others = {pid: b for pid, b in bases.items() if b and pid != self_id}
-        other_tele = await asyncio.gather(*(_qget(client, "/telemetry?details_level=3", base=b) for b in others.values()))
-        tele_by_peer = {self_id: _d(tele)}
-        for pid, (t, _) in zip(others, other_tele):
-            served = str(_d(_d(_d(t).get("cluster")).get("status")).get("peer_id") or "")
+        others = {pid: b for pid, b in bases.items() if b and pid != self_id} if deep else {}
+        (tele, e4), *other_tele = await asyncio.gather(
+            _qget(client, f"/telemetry?details_level=6&{t}") if deep else _skip(),
+            *(_qget(client, f"/telemetry?details_level=3&{t}", base=b) for b in others.values()),
+        )
+        metrics_txt, e6 = await _qget(client, f"/metrics?per_collection=true&{t}", raw=True) if deep else (None, None)
+        tele_by_peer = {self_id: _d(tele)} if deep else {}
+        for pid, (pt, _) in zip(others, other_tele):
+            served = str(_d(_d(_d(pt).get("cluster")).get("status")).get("peer_id") or "")
             if not served or served == pid:
-                tele_by_peer[pid] = _d(t)
+                tele_by_peer[pid] = _d(pt)
         views, remote_stats, view_errors, local_status = await _replica_views(client, bases, name, tele_by_peer)
         cltele = None
         # Covers peers with no endpoint and peers whose endpoint is down or now serves another peer.
-        if any(v is None for v in views.values()):
-            cltele, cterr = await _qget(client, "/cluster/telemetry?details_level=3")
+        if deep and any(v is None for v in views.values()):
+            cltele, cterr = await _qget(client, f"/cluster/telemetry?details_level=3&{t}")
             if cterr:
                 view_errors.append(cterr)
         if "local" in bases and "local" not in views and len(views) == 1:
@@ -2065,6 +2178,7 @@ async def collection_health(request: Request, name: str):
         "facets": facets,
         "points": points,
         "hw": _d(_d(_d(tele.get("hardware")).get("collection_data")).get(name)),
+        "deep": deep,
     })
 
 

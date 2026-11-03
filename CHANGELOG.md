@@ -6,6 +6,10 @@ User-visible changes, newest first. Sections are dated; add new work under **Unr
 
 ### Changed
 - Collection page opens on a new **Overview** tab (formerly Health); Browse is the second tab.
+- **Faster on large clusters.** The home page no longer calls `/telemetry`, `/cluster/telemetry` or `/metrics`; it opens with `/collections`, `/cluster`, `/healthz`, `/readyz` and `/issues`, then loads one row per collection from `/collections/{name}` and `/collections/{name}/cluster`. Rows list problems first, and you can filter them by name. The memory column moved to each collection's page.
+- The collection Overview no longer loads telemetry by itself. Segments, search paths, API latency, optimizer history and other peers' views load with **Load telemetry details**.
+- Telemetry and `/metrics` calls on the cluster page run one at a time with a 20 s server-side `timeout`, because Qdrant serves them from one locked collector.
+- Live charts pause when a `/metrics` sample takes over 2 s, so the app does not delay Prometheus scrapes.
 
 ## 2026-11-03
 

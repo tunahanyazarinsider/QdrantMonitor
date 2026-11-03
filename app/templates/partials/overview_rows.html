@@ -1,0 +1,81 @@
+{% import "partials/macros.html" as m %}
+<span id="overview-points" hx-swap-oob="true">&middot; {{ "{:,}".format(total_points) }} points</span>
+{% if errors %}
+<p class="text-xs text-[#f87171] mb-3">▲ <span class="font-mono">{{ errors | join(' · ') | trunc(300) }}</span></p>
+{% endif %}
+{% if rows %}
+{% set bad = rows | selectattr('errors') | list | length %}
+{% set warn = rows | rejectattr('errors') | selectattr('warnings') | list | length %}
+<p class="text-xs mb-3 {{ 'text-[#f87171]' if bad else ('text-[#fbbf24]' if warn else 'text-[#4ade80]') }}">
+  {% if bad or warn %}▲ {{ bad }} with errors · {{ warn }} with warnings · {{ rows | length - bad - warn }} ok{% else %}● all {{ rows | length }} collections ok{% endif %}
+</p>
+{% endif %}
+<div class="overflow-x-auto">
+  <table class="qd-table w-full text-xs">
+    <thead><tr>
+      <th class="text-left px-3 py-2">Collection</th>
+      <th class="text-left px-3 py-2">Health</th>
+      <th class="text-right px-3 py-2">Points</th>
+      <th class="text-left px-3 py-2">Vectors</th>
+      <th class="text-left px-3 py-2">Replicas</th>
+      <th class="text-left px-3 py-2 w-32">HNSW-indexed</th>
+      <th class="text-left px-3 py-2">Findings</th>
+      <th class="px-2 py-2"><span class="sr-only">Delete</span></th>
+    </tr></thead>
+    <tbody>
+    {% for c in rows %}
+    {% set mx = c.replicas or {} %}
+    <tr data-name="{{ c.name }}">
+      <td class="px-3 py-2"><a href="/collection/{{ c.name | urlencode }}" class="font-mono text-[#38bdf8] hover:text-[#00e5a0]">{{ c.name }}</a>
+        {% if c.info_error %}<div class="text-[0.6875rem] text-[#f87171]" title="{{ c.info_error }}">▲ info unavailable</div>{% endif %}
+        {% if c.view_error %}<div class="text-[0.6875rem] text-[#fbbf24]" title="{{ c.view_error }}">▲ shard view unavailable</div>{% endif %}</td>
+      <td class="px-3 py-2 whitespace-nowrap">
+        {{ m.status_badge(c.coll_status, status_meaning) }}
+        <div class="text-[0.6875rem] mt-1 {{ 'text-[#f87171]' if c.optimizer_error else 'text-[#94a8c8]' }}" {% if c.optimizer_error %}title="{{ c.optimizer_error }}"{% endif %}>
+          optimizer {% if c.optimizer_error %}▲ error{% elif c.optimizer_known %}ok{% else %}—{% endif %}
+        </div>
+      </td>
+      <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(c.points) if c.points is number else '—' }}</td>
+      <td class="px-3 py-2 font-mono whitespace-nowrap">
+        {% for v in c.vec_names %}<div><span class="text-[#38bdf8]">{{ v.name }}</span> <span class="text-[#94a8c8]">{{ v.size }}d · {{ v.distance }}</span></div>{% endfor %}
+        {% for n in c.sparse_names %}<div><span class="text-[#f59e0b]">{{ n }}</span> <span class="text-[#94a8c8]">sparse</span></div>{% endfor %}
+      </td>
+      <td class="px-3 py-2 whitespace-nowrap">
+        {% if mx.shards %}
+        {% set readable = mx.shards | sum(attribute='readable') %}
+        {% set total = mx.shards | sum(attribute='total') %}
+        <span class="badge {{ 'badge-green' if readable == total else ('badge-red' if readable == 0 else 'badge-yellow') }}">{{ '●' if readable == total else '▲' }} {{ readable }}/{{ total }} readable</span>
+        {% else %}<span class="text-[#94a8c8]">—</span>{% endif %}
+        <div class="text-[0.6875rem] text-[#94a8c8] mt-1 font-mono">{{ c.shards }} shard{{ 's' if c.shards != 1 }} × RF {{ c.replication }}{% if c.transfers %} · <span class="text-[#fbbf24]">{{ c.transfers }} transfer{{ 's' if c.transfers != 1 }}</span>{% endif %}</div>
+      </td>
+      <td class="px-3 py-2">
+        {% set ipct = (c.indexed_vectors / c.vectors_est * 100) if c.indexed_vectors is number and c.vectors_est else none %}
+        {% if ipct is not none %}
+        <div class="flex items-center gap-2">
+          <div class="meter flex-1 {% if ipct < 50 %}meter-bad{% elif ipct < 99 %}meter-warn{% endif %}"><span style="width: {{ [ipct, 100] | min }}%"></span></div>
+          <span class="font-mono w-10 text-right">{{ [ipct, 100] | min | round(0) | int }}%</span>
+        </div>
+        {% else %}<span class="text-[#94a8c8]">—</span>{% endif %}
+        <div class="text-[0.6875rem] text-[#94a8c8] mt-1">{{ c.segments_count if c.segments_count is number else '—' }} segment{{ 's' if c.segments_count != 1 }}</div>
+      </td>
+      <td class="px-3 py-2 whitespace-nowrap">
+        {% if c.errors %}<a href="/collection/{{ c.name | urlencode }}" class="badge badge-red">▲ {{ c.errors }} error{{ 's' if c.errors != 1 }}</a>{% endif %}
+        {% if c.warnings %}<a href="/collection/{{ c.name | urlencode }}" class="badge badge-yellow">▲ {{ c.warnings }} warning{{ 's' if c.warnings != 1 }}</a>{% endif %}
+        {% if not c.errors and not c.warnings %}<span class="text-[#4ade80]">● none</span>{% endif %}
+      </td>
+      <td class="px-2 py-2">
+        <form action="/api/collections/{{ c.name | urlencode }}/delete" method="post"
+              onsubmit='return confirm({{ ("Delete collection " ~ c.name ~ "? This is irreversible.") | tojson }})'>
+          <button type="submit" class="text-[#94a8c8] hover:text-[#f87171] text-xs px-2 py-1 rounded hover:bg-[rgba(248,113,113,0.08)]"
+                  title="Delete collection {{ c.name }}" aria-label="Delete collection {{ c.name }}">✕</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="text-[0.6875rem] text-[#94a8c8] mt-2">
+  Read from <span class="font-mono">/collections/{name}</span> and <span class="font-mono">/collections/{name}/cluster</span> on the connected peer only, so replica states are that peer's consensus view.
+  HNSW-indexed compares indexed vectors with points × dense vector names. Memory, segments and telemetry are on each collection's page.
+</p>

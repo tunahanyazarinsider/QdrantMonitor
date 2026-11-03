@@ -7,10 +7,10 @@
 <div class="flex items-center justify-between mb-8">
   <div>
     <h1 class="font-display font-bold text-2xl text-white tracking-tight">Collections</h1>
-    <p class="text-sm text-[#4b5f82] mt-1">
+    <p class="text-sm text-[#94a8c8] mt-1">
       {% if conn.connected %}
-        {{ collections | length }} collection{{ 's' if collections | length != 1 else '' }}
-        &middot; {{ "{:,}".format(total_points) }} total points
+        {{ names | length }} collection{{ 's' if names | length != 1 else '' }}
+        <span id="overview-points"></span>
         &middot; <span class="font-mono text-xs">{{ conn.host }}:{{ conn.port }}</span>
       {% else %}
         Not connected to Qdrant
@@ -215,7 +215,7 @@ document.getElementById('migrate-form')?.addEventListener('submit', async functi
   <p class="text-sm text-[#4b5f82]">{{ conn.error or 'Check host and port in the top bar' }}</p>
 </div>
 
-{% elif collections | length == 0 and not errors %}
+{% elif names | length == 0 and not errors %}
 <!-- ── Empty state ── -->
 <div class="qd-card p-12 text-center">
   <div class="mx-auto mb-4 w-12 h-12 rounded-full bg-[rgba(0,229,160,0.08)] flex items-center justify-center">
@@ -224,7 +224,7 @@ document.getElementById('migrate-form')?.addEventListener('submit', async functi
     </svg>
   </div>
   <p class="text-white font-medium mb-2">No collections found</p>
-  <p class="text-sm text-[#4b5f82]">Create a collection in Qdrant to see it here</p>
+  <p class="text-sm text-[#94a8c8]">Create one with + New Collection.</p>
 </div>
 
 {% else %}
@@ -232,7 +232,7 @@ document.getElementById('migrate-form')?.addEventListener('submit', async functi
 {% if health %}
 <section class="mb-6" aria-label="Cluster health">
   <div class="flex items-center justify-between mb-2">
-    <h2 class="hud-title mb-0">Cluster <span class="hud-sub">{{ peers | length or 1 }} peer{{ 's' if (peers | length) != 1 }}{% if app_info.version %} · Qdrant {{ app_info.version }}{% endif %}</span></h2>
+    <h2 class="hud-title mb-0">Cluster <span class="hud-sub">{{ peer_count }} peer{{ 's' if peer_count != 1 }}{% if version %} · Qdrant {{ version }}{% endif %}</span></h2>
     <a href="/cluster" class="text-xs text-[#94a8c8] hover:text-[#00e5a0]">Cluster details →</a>
   </div>
   <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
@@ -254,82 +254,31 @@ document.getElementById('migrate-form')?.addEventListener('submit', async functi
 
 <!-- ── Collections overview ── -->
 <section class="qd-card p-5">
-  <h2 class="hud-title">Collections <span class="hud-sub">one row per collection · click a name for its overview, replicas and segments</span></h2>
-  <div class="overflow-x-auto">
-    <table class="qd-table w-full text-xs">
-      <thead><tr>
-        <th class="text-left px-3 py-2">Collection</th>
-        <th class="text-left px-3 py-2">Health</th>
-        <th class="text-right px-3 py-2">Points</th>
-        <th class="text-left px-3 py-2">Vectors</th>
-        <th class="text-left px-3 py-2">Replicas</th>
-        <th class="text-left px-3 py-2 w-32">HNSW-indexed</th>
-        <th class="text-right px-3 py-2">Memory</th>
-        <th class="text-left px-3 py-2">Findings</th>
-        <th class="px-2 py-2"><span class="sr-only">Delete</span></th>
-      </tr></thead>
-      <tbody>
-      {% for c in collections %}
-      {% set mx = c.replicas or {} %}
-      <tr>
-        <td class="px-3 py-2"><a href="/collection/{{ c.name }}" class="font-mono text-[#38bdf8] hover:text-[#00e5a0]">{{ c.name }}</a>
-          {% if c.info_error %}<div class="text-[0.6875rem] text-[#f87171]" title="{{ c.info_error }}">▲ info unavailable</div>{% endif %}</td>
-        <td class="px-3 py-2 whitespace-nowrap">
-          {% set cs = c.coll_status %}
-          {{ m.status_badge(cs, status_meaning) }}
-          <div class="text-[0.6875rem] mt-1 {{ 'text-[#f87171]' if c.optimizer_error else 'text-[#94a8c8]' }}" {% if c.optimizer_error %}title="{{ c.optimizer_error }}"{% endif %}>
-            optimizer {% if c.optimizer_error %}▲ error{% elif c.optimizer_known %}ok{% else %}—{% endif %}{% if c.running_opt %} · <span class="text-[#fbbf24]">{{ c.running_opt | int }} running</span>{% endif %}
-          </div>
-        </td>
-        <td class="px-3 py-2 text-right font-mono">{{ '{:,}'.format(c.cluster_points) }}
-          {% if c.vectors_total and c.vec_names | length == 1 and not c.sparse_names and c.vectors_total > c.cluster_points %}<div class="text-[0.6875rem] text-[#94a8c8]" title="vectors include deleted ones until the optimizer vacuums them">{{ '{:,}'.format(c.vectors_total) }} vectors</div>{% endif %}</td>
-        <td class="px-3 py-2 font-mono whitespace-nowrap">
-          {% for v in c.vec_names %}<div><span class="text-[#38bdf8]">{{ v.name }}</span> <span class="text-[#94a8c8]">{{ v.size }}d · {{ v.distance }}</span></div>{% endfor %}
-          {% for n in c.sparse_names %}<div><span class="text-[#f59e0b]">{{ n }}</span> <span class="text-[#94a8c8]">sparse</span></div>{% endfor %}
-        </td>
-        <td class="px-3 py-2 whitespace-nowrap">
-          {% if mx.shards %}
-          {% set readable = mx.shards | sum(attribute='readable') %}
-          {% set total = mx.shards | sum(attribute='total') %}
-          <span class="badge {{ 'badge-green' if readable == total else ('badge-red' if readable == 0 else 'badge-yellow') }}">{{ '●' if readable == total else '▲' }} {{ readable }}/{{ total }} readable</span>
-          {% else %}<span class="text-[#94a8c8]">—</span>{% endif %}
-          <div class="text-[0.6875rem] text-[#94a8c8] mt-1 font-mono">{{ c.shards }} shard{{ 's' if c.shards != 1 }} × RF {{ c.replication }}{% if c.transfers %} · <span class="text-[#fbbf24]">{{ c.transfers }} transfer</span>{% endif %}</div>
-        </td>
-        <td class="px-3 py-2">
-          {% set ipct = (c.indexed_vectors / c.vectors_total * 100) if c.indexed_vectors is number and c.vectors_total else none %}
-          {% if ipct is not none %}
-          <div class="flex items-center gap-2">
-            <div class="meter flex-1 {% if ipct < 50 %}meter-bad{% elif ipct < 99 %}meter-warn{% endif %}"><span style="width: {{ [ipct, 100] | min }}%"></span></div>
-            <span class="font-mono w-10 text-right">{{ [ipct, 100] | min | round(0) | int }}%</span>
-          </div>
-          {% else %}<span class="text-[#94a8c8]">—</span>{% endif %}
-          <div class="text-[0.6875rem] text-[#94a8c8] mt-1">{{ c.segments_count if c.segments_count is number else '—' }} segment{{ 's' if c.segments_count != 1 }}</div>
-        </td>
-        <td class="px-3 py-2 text-right font-mono whitespace-nowrap">
-          {% if c.usage %}
-          <div>{{ c.usage.disk_bytes | bytes }} <span class="text-[#94a8c8]">disk</span></div>
-          <div>{{ c.usage.ram_bytes | bytes }} <span class="text-[#94a8c8]">heap</span></div>
-          <div class="{% if c.usage.warm_pct is number and c.usage.warm_pct < 80 %}text-[#fbbf24]{% endif %}">{{ '%.0f%%' | format(c.usage.warm_pct) if c.usage.warm_pct is number else '—' }} <span class="text-[#94a8c8]">warm</span></div>
-          {% else %}{{ (c.vectors_bytes + c.payload_bytes) | bytes }} <span class="text-[#94a8c8]">on disk</span>{% endif %}
-        </td>
-        <td class="px-3 py-2 whitespace-nowrap">
-          {% if c.errors %}<a href="/collection/{{ c.name }}" class="badge badge-red">▲ {{ c.errors }} error{{ 's' if c.errors != 1 }}</a>{% endif %}
-          {% if c.warnings %}<a href="/collection/{{ c.name }}" class="badge badge-yellow">▲ {{ c.warnings }} warning{{ 's' if c.warnings != 1 }}</a>{% endif %}
-          {% if not c.errors and not c.warnings %}<span class="text-[#4ade80]">● none</span>{% endif %}
-        </td>
-        <td class="px-2 py-2">
-          <form action="/api/collections/{{ c.name }}/delete" method="post"
-                onsubmit='return confirm({{ ("Delete collection " ~ c.name ~ "? This is irreversible.") | tojson }})'>
-            <button type="submit" class="text-[#94a8c8] hover:text-[#f87171] text-xs px-2 py-1 rounded hover:bg-[rgba(248,113,113,0.08)]"
-                    title="Delete collection {{ c.name }}" aria-label="Delete collection {{ c.name }}">✕</button>
-          </form>
-        </td>
-      </tr>
-      {% endfor %}
-      </tbody>
-    </table>
+  <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
+    <h2 class="hud-title mb-0">Collections <span class="hud-sub">problems first · click a name for memory, segments and telemetry</span></h2>
+    <div>
+      <label for="coll-filter" class="sr-only">Filter collections by name</label>
+      <input id="coll-filter" type="search" placeholder="Filter by name" autocomplete="off"
+             class="qd-input text-xs py-1.5 w-56" oninput="filterCollections(this.value)">
+    </div>
   </div>
-  <p class="text-[0.6875rem] text-[#94a8c8] mt-2">Points = largest replica per shard, summed. Findings count replica, placement, status and optimizer issues; open the collection for details.</p>
+  <div id="overview-table" hx-get="/api/overview/rows" hx-trigger="load" hx-swap="innerHTML">
+    <div class="flex items-center gap-3 py-10 justify-center text-xs text-[#94a8c8]">
+      <div class="qd-spinner"></div>
+      Reading status and replicas of {{ "{:,}".format(names | length) }} collection{{ 's' if names | length != 1 }} (2 requests each)…
+    </div>
+  </div>
 </section>
+<script>
+function filterCollections(q) {
+  q = q.trim().toLowerCase();
+  document.querySelectorAll('#overview-table tbody tr[data-name]').forEach(tr => {
+    tr.hidden = q && !tr.dataset.name.toLowerCase().includes(q);
+  });
+}
+document.body.addEventListener('htmx:afterSwap', e => {
+  if (e.target.id === 'overview-table') filterCollections(document.getElementById('coll-filter').value);
+});
+</script>
 {% endif %}
 {% endblock %}

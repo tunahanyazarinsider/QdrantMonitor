@@ -5,6 +5,22 @@
 </div>
 {% endif %}
 
+<button class="qd-btn-ghost text-xs py-1.5" id="health-refresh" hx-swap-oob="true"
+        hx-get="/api/{{ collection_name | urlencode }}/health{{ '?deep=1' if deep }}"
+        hx-target="#health-content" hx-swap="innerHTML" hx-indicator="#health-spinner">Refresh</button>
+{% if not deep %}
+<div class="qd-card p-4 mb-5 flex flex-wrap items-center justify-between gap-3">
+  <p class="text-xs text-[#94a8c8] max-w-3xl">
+    Segments, search paths, API latency, optimizer history, replica traffic and other peers' views come from
+    Qdrant telemetry and <span class="font-mono">/metrics</span>. Neither can be limited to one collection, so on a cluster
+    with many collections they can take minutes and delay Prometheus scrapes. This view uses only per-collection endpoints.
+  </p>
+  <button type="button" class="qd-btn-ghost text-xs py-1.5 px-3 shrink-0"
+          hx-get="/api/{{ collection_name | urlencode }}/health?deep=1" hx-target="#health-content" hx-swap="innerHTML"
+          hx-indicator="#health-spinner">Load telemetry details</button>
+</div>
+{% endif %}
+
 <!-- ── Findings ── -->
 <section class="qd-card p-5 mb-5">
   <h2 class="hud-title">Findings <span class="hud-sub">rule-based checks on config, shards, segments and indexes</span></h2>
@@ -93,7 +109,7 @@
         <td class="px-3 py-2 font-mono text-[#d0dce8]">{{ t.component }}</td>
         <td class="px-3 py-2"><span class="tier tier-{{ t.tier }}">{{ t.tier }}</span></td>
         <td class="px-3 py-2 text-[#7b8fb5]">{{ t.source }}</td>
-        <td class="px-3 py-2 text-right font-mono whitespace-nowrap">{{ t.bytes | bytes }}{% if t.estimated %} <span class="text-[#7b8fb5]">est.</span>{% endif %}</td>
+        <td class="px-3 py-2 text-right font-mono whitespace-nowrap">{% if deep %}{{ t.bytes | bytes }}{% else %}—{% endif %}{% if deep and t.estimated %} <span class="text-[#7b8fb5]">est.</span>{% endif %}</td>
       </tr>
       {% endfor %}
       </tbody>
@@ -274,6 +290,7 @@
 </section>
 
 <!-- ── Latency ── -->
+{% if deep %}
 <section class="qd-card p-5 mb-5">
   <h2 class="hud-title">API latency <span class="hud-sub">this collection · since startup</span></h2>
   {% if not latency %}
@@ -302,6 +319,7 @@
   </div>
   {% endif %}
 </section>
+{% endif %}
 
 <!-- ── Payload indexes ── -->
 <section class="qd-card p-5 mb-5">
@@ -366,6 +384,7 @@
 </section>
 
 <!-- ── Segments ── -->
+{% if deep %}
 <section class="qd-card p-5 mb-5" id="health-segments">
   <h2 class="hud-title">Segments <span class="hud-sub">state, index coverage, storage and config drift per segment</span></h2>
   <div id="segments-content">
@@ -373,8 +392,11 @@
   </div>
 </section>
 
+{% endif %}
+
 <div class="grid grid-cols-1 xl:grid-cols-2 gap-5 mb-5">
   <!-- ── Search paths ── -->
+  {% if deep %}
   <section class="qd-card p-5">
     <h2 class="hud-title">Search paths <span class="hud-sub">how searches were executed, summed over segments</span></h2>
     {% if not search_stats %}
@@ -401,6 +423,7 @@
     <p class="text-[0.6875rem] text-[#7b8fb5] mt-2">Paths containing <span class="font-mono">plain</span> or <span class="font-mono">exact</span> bypass HNSW and scan vectors.</p>
     {% endif %}
   </section>
+  {% endif %}
 
   <!-- ── Optimizer ── -->
   <section class="qd-card p-5">
@@ -426,7 +449,7 @@
       </li>
       {% endfor %}
     </ul>
-    {% else %}
+    {% elif deep %}
     <p class="text-xs text-[#7b8fb5]">No optimizations since startup.</p>
     {% endif %}
   </section>
