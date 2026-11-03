@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import re
 import time
@@ -1834,12 +1835,17 @@ async def collection_segments(request: Request, name: str, peer: str = Query("")
         self_id = str(clus.get("peer_id") or "")
         base = bases.get(peer) if peer else _qdrant_base_url()
         if peer and not base:
-            return HTMLResponse(f"<p class='text-[#fbbf24] p-4 text-xs'>▲ Peer {peer} has no mapped endpoint.</p>")
+            return HTMLResponse(f"<p class='text-[#fbbf24] p-4 text-xs'>▲ Peer {html.escape(peer)} has no mapped endpoint.</p>")
         # ponytail: level 6 telemetry covers every collection on that peer; fine for a handful of collections.
-        (info, e1), (tele, e2) = await asyncio.gather(
+        (info, e1), (tele, e2), (who, _) = await asyncio.gather(
             _qget(client, f"/collections/{q}"),
             _qget(client, "/telemetry?details_level=6", base=base),
+            _qget(client, "/cluster", base=base),
         )
+    served = str(_d(who).get("peer_id") or "")
+    if peer and served and served != peer:
+        return HTMLResponse(f"<p class='text-[#fbbf24] p-4 text-xs'>▲ {html.escape(base)} now serves peer "
+                            f"{html.escape(served)}, not {html.escape(peer)}; remap it on the Cluster page.</p>")
     analysis = insights.segment_analysis(_local_segments(_d(tele), name), _d(_d(info).get("config")))
     return _render(request, "partials/segments.html", {
         "seg": analysis,
@@ -1875,15 +1881,13 @@ async def collection_health(request: Request, name: str):
         others = {pid: b for pid, b in bases.items() if b and pid != self_id}
         other_tele = await asyncio.gather(*(_qget(client, "/telemetry?details_level=3", base=b) for b in others.values()))
         tele_by_peer = {self_id: _d(tele), **{pid: _d(t) for pid, (t, _) in zip(others, other_tele)}}
-        async def no_telemetry():
-            return None, None
-        need_ct = any(b is None for b in bases.values())
-        (views, remote_stats, view_errors), (cltele, cterr) = await asyncio.gather(
-            _replica_views(client, bases, name, tele_by_peer),
-            _qget(client, "/cluster/telemetry?details_level=3") if need_ct else no_telemetry(),
-        )
-        if cterr:
-            view_errors.append(cterr)
+        views, remote_stats, view_errors = await _replica_views(client, bases, name, tele_by_peer)
+        cltele = None
+        # Covers peers with no endpoint and peers whose endpoint is down or now serves another peer.
+        if any(v is None for v in views.values()):
+            cltele, cterr = await _qget(client, "/cluster/telemetry?details_level=3")
+            if cterr:
+                view_errors.append(cterr)
         if "local" in bases and "local" not in views and len(views) == 1:
             self_id = next(iter(views))
             bases = {self_id: bases["local"]}
@@ -1916,9 +1920,9 @@ async def collection_health(request: Request, name: str):
         (c for c in _d(tele.get("collections")).get("collections") or [] if c.get("id") == name), {}
     )
     segments, opt_log, nbyname, vbytes, pbytes = [], [], {}, 0, 0
+    segments = _local_segments(tele, name)
     for s in coll_tele.get("shards") or []:
         local = _d(s.get("local"))
-        segments += [{**seg, "_shard": s.get("id")} for seg in local.get("segments") or []]
         opt_log += _d(local.get("optimizations")).get("log") or []
         vbytes += local.get("vectors_size_bytes") or 0
         pbytes += local.get("payloads_size_bytes") or 0
@@ -1965,7 +1969,6 @@ async def collection_health(request: Request, name: str):
         "shard_info": _d(shard_info),
         "optimizations": _d(opts),
         "opt_log": sorted(opt_log, key=lambda o: o.get("start_at") or "", reverse=True)[:15],
-        "segments": [{**_d(s.get("info")), "config": _d(s.get("config"))} for s in segments],
         "tiers": tiers,
         "usage": usage,
         "latency": insights.latency_table(coll_metrics),

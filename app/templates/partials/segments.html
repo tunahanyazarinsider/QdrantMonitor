@@ -24,8 +24,8 @@
     <div class="font-mono text-[#d0dce8] mt-1">{{ rows | length }} · {{ immutable | length }} immutable · {{ rows | length - immutable | length }} appendable</div></div>
   <div class="health-cell"><div class="text-[0.6875rem] uppercase tracking-wider text-[#7b8fb5]">Points</div>
     <div class="font-mono text-[#d0dce8] mt-1">{{ '{:,}'.format(seg.total_points) }}</div></div>
-  <div class="health-cell {% if seg.unindexed %}{% endif %}"><div class="text-[0.6875rem] uppercase tracking-wider text-[#7b8fb5]">Not HNSW-indexed</div>
-    <div class="font-mono mt-1 {{ 'text-[#fbbf24]' if seg.unindexed else 'text-[#4ade80]' }}">{{ '▲ ' if seg.unindexed else '● ' }}{{ '{:,}'.format(seg.unindexed) }} vectors</div></div>
+  <div class="health-cell"><div class="text-[0.6875rem] uppercase tracking-wider text-[#7b8fb5]">Not HNSW-indexed</div>
+    <div class="font-mono mt-1 {{ 'text-[#fbbf24]' if seg.unindexed else 'text-[#4ade80]' }}">{{ '▲ ' if seg.unindexed else '● ' }}{{ '{:,}'.format(seg.unindexed) }} vectors{% if seg.total_vectors %} · {{ (seg.unindexed / seg.total_vectors * 100) | round(1) }}%{% endif %}</div></div>
   <div class="health-cell"><div class="text-[0.6875rem] uppercase tracking-wider text-[#7b8fb5]">Config drift</div>
     {% set drifted = rows | selectattr('drift') | list | length %}
     <div class="font-mono mt-1 {{ 'text-[#fbbf24]' if drifted else 'text-[#4ade80]' }}">{{ '▲ ' if drifted else '● ' }}{{ drifted }} segment{{ 's' if drifted != 1 }}</div></div>
@@ -47,7 +47,6 @@
     </tr></thead>
     <tbody>
     {% for r in rows %}
-    {% set v = r.vector_configs[0] if r.vector_configs else {} %}
     <tr>
       <td class="px-2 py-2 align-top">
         <button type="button" onclick="toggleDetail(this)" aria-label="Show segment {{ r.uuid[:8] }} details"
@@ -63,6 +62,7 @@
           <span class="badge {{ 'badge-blue' if r.appendable else '' }} {{ '' if r.appendable else 'text-[#94a8c8] border border-[#243049]' }}"
                 title="{{ 'Receives new writes' if r.appendable else 'Read-only; rebuilt only by the optimizer' }}">{{ 'appendable' if r.appendable else 'immutable' }}</span>
           {% if r.drift %}<span class="badge badge-yellow" title="{{ r.drift | join(', ') }}">▲ drift</span>{% endif %}
+          {% if r.over_threshold %}<span class="badge badge-yellow" title="{{ r.plain_kib | round(0) | int }} KiB unindexed, over indexing_threshold">▲ index overdue</span>{% endif %}
         </div>
       </td>
       <td class="px-3 py-2 align-top text-right font-mono">{{ '{:,}'.format(r.points) }}</td>
@@ -140,7 +140,7 @@
   </table>
 </div>
 <p class="text-[0.6875rem] text-[#94a8c8] mt-2">
-  Appendable segments take new writes and stay plain until they pass indexing_threshold{% if indexing_threshold %} ({{ '{:,}'.format(indexing_threshold) }}){% endif %};
+  Appendable segments take new writes and stay plain until their vectors exceed indexing_threshold{% if indexing_threshold %} ({{ '{:,}'.format(indexing_threshold) }} KiB per segment){% endif %};
   the optimizer then builds an immutable indexed segment. Qdrant does not expose on-disk file format versions through its API.
 </p>
 {% endif %}

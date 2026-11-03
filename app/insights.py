@@ -344,13 +344,18 @@ def replica_matrix(views: dict[str, dict | None], remote_stats: dict[str, list] 
         for r in replicas:
             states = set(r["seen"].values()) or ({r["state"]} if r["state"] else set())
             r["consensus_state"] = r["state"] or (next(iter(states)) if len(states) == 1 else None)
-            r["disagree"] = len(states) > 1
+            relayed_conflict = r["source"] == "cluster telemetry" and r["seen"] and r["state"] not in states
+            r["disagree"] = len(states) > 1 or bool(relayed_conflict)
+            if relayed_conflict:
+                states = states | {r["state"]}
             r["readable"] = all(REPLICA_STATES.get(s, {}).get("readable") for s in states) if states else None
             r["delta"] = (r["points"] - top) if top is not None and r["points"] is not None else None
             readable += bool(r["readable"])
             label = f"shard {shard_id} on peer {r['peer']}"
             if r["disagree"]:
                 by = ", ".join(f"{v} → {s}" for v, s in sorted(r["seen"].items()))
+                if relayed_conflict:
+                    by = f"its own report (via cluster telemetry) → {r['state']}, " + by
                 findings.append(("error", f"Peers disagree on {label}: {by}. Clients routed to different peers see a different cluster."))
             bad = sorted(s for s in states if s != "Active")
             for s in bad:
@@ -438,9 +443,9 @@ def _quant_expected(config: dict, vector_name: str) -> str | None:
 def segment_analysis(segments: list, config: dict) -> dict:
     """segments: telemetry shards[].local.segments[] entries, each optionally tagged with "_shard"."""
     opt = config.get("optimizer_config") or {}
-    threshold = opt.get("indexing_threshold")
-    rows, drift, findings = [], [], []
-    total_points = unindexed = deferred = 0
+    threshold_kib = opt.get("indexing_threshold")  # Qdrant: KiB of vectors per segment, not a vector count
+    rows, drift, findings, overdue = [], [], [], []
+    total_points = total_vectors = unindexed = deferred = 0
 
     for seg in segments:
         info, cfg = seg.get("info") or {}, seg.get("config") or {}
@@ -455,7 +460,7 @@ def segment_analysis(segments: list, config: dict) -> dict:
                  "hnsw_on_disk": opts.get("on_disk"), "quantization": q[0] if q else None,
                  "num_vectors": counts.get("num_vectors"), "num_indexed": counts.get("num_indexed_vectors"),
                  "drift": []}
-            if v["index"] == "hnsw":
+            if v["index"] == "hnsw" and config:
                 want = _hnsw_expected(config, vname)
                 for k in ("m", "ef_construct", "payload_m", "on_disk"):
                     have = opts.get(k)
@@ -477,6 +482,7 @@ def segment_analysis(segments: list, config: dict) -> dict:
         n_del = info.get("num_deleted_vectors") or 0
         n_pts = info.get("num_points") or 0
         total_points += n_pts
+        total_vectors += n_vec
         unindexed += max(n_vec - n_idx, 0)
         deferred += info.get("num_deferred_points") or 0
         row = {
@@ -490,15 +496,21 @@ def segment_analysis(segments: list, config: dict) -> dict:
             "vector_configs": vectors, "payload_indexes": pidx,
             "drift": [d for v in vectors for d in v["drift"]],
         }
+        plain_kib = (info.get("vectors_size_bytes") or 0) / 1024 if n_vec > n_idx else 0
+        row["plain_kib"] = plain_kib
+        row["over_threshold"] = bool(isinstance(threshold_kib, (int, float)) and threshold_kib and plain_kib >= threshold_kib)
         rows.append(row)
         if row["drift"]:
             drift.append(row)
+        if row["over_threshold"]:
+            overdue.append(row)
 
     if unindexed:
-        share = unindexed / total_points * 100 if total_points else 0
-        where = f" (below indexing_threshold={threshold:,})" if isinstance(threshold, int) and unindexed < threshold else ""
-        lvl = "warn" if isinstance(threshold, int) and unindexed >= threshold * 2 else "info"
-        findings.append((lvl, f"{unindexed:,} vectors ({share:.1f}%) are not HNSW-indexed yet{where}; searches scan them brute-force."))
+        share = unindexed / total_vectors * 100 if total_vectors else 0
+        findings.append(("info", f"{unindexed:,} vectors ({share:.1f}% of vectors) are not HNSW-indexed yet; searches scan them brute-force."))
+    for r in overdue:
+        findings.append(("warn", f"Segment {r['uuid'][:8]} holds {r['plain_kib']:,.0f} KiB of unindexed vectors, over "
+                                 f"indexing_threshold={threshold_kib:,} KiB: the optimizer has not indexed it yet."))
     if drift:
         sample = drift[0]["drift"][0]
         findings.append(("warn", f"{len(drift)} segment(s) were built with settings that differ from the collection config "
@@ -506,7 +518,8 @@ def segment_analysis(segments: list, config: dict) -> dict:
     if deferred:
         findings.append(("info", f"{deferred:,} point(s) are waiting for deferred indexing."))
     rows.sort(key=lambda r: (r["shard"] if r["shard"] is not None else -1, not r["appendable"], -(r["points"] or 0)))
-    return {"rows": rows, "findings": findings, "unindexed": unindexed, "total_points": total_points}
+    return {"rows": rows, "findings": findings, "unindexed": unindexed, "total_points": total_points,
+            "total_vectors": total_vectors, "threshold_kib": threshold_kib}
 
 
 def _segment_infos(segments: list) -> list[dict]:
@@ -752,7 +765,12 @@ if __name__ == "__main__":
     assert part["unreachable"] == ["b"], part["unreachable"]
     relayed = replica_matrix({"a": {"peer_id": "a", "local_shards": [], "remote_shards": [{"shard_id": 0, "peer_id": "b", "state": "Partial"}]}, "b": None},
                              None, [{"id": 0, "replicas": [{"peer_id": "b", "state": "Active", "num_points": 1}]}])
-    assert not relayed["shards"][0]["replicas"][0]["disagree"]
+    rr = relayed["shards"][0]["replicas"][0]
+    assert rr["disagree"] and rr["readable"] is False, rr
+    assert any("its own report" in m_ for _, m_ in relayed["findings"]), relayed["findings"]
+    agree = replica_matrix({"a": {"peer_id": "a", "local_shards": [], "remote_shards": [{"shard_id": 0, "peer_id": "b", "state": "Active"}]}, "b": None},
+                           None, [{"id": 0, "replicas": [{"peer_id": "b", "state": "Active", "num_points": 1}]}])
+    assert not agree["shards"][0]["replicas"][0]["disagree"]
     seg_cfg = {"params": {"vectors": {"v": {"size": 4, "on_disk": True}}},
                "hnsw_config": {"m": 0, "ef_construct": 128, "payload_m": 16, "on_disk": False},
                "optimizer_config": {"indexing_threshold": 20000},
@@ -761,6 +779,7 @@ if __name__ == "__main__":
         index = {"type": "plain", "options": {}} if typ == "plain" else {
             "type": "hnsw", "options": {"m": m, "ef_construct": 128, "payload_m": 16, "on_disk": False}}
         return {"_shard": 0, "info": {"uuid": uuid, "segment_type": typ, "num_points": pts, "num_vectors": pts + deleted,
+                                       "vectors_size_bytes": (pts + deleted) * 1024,
                                        "num_indexed_vectors": idx, "num_deleted_vectors": deleted, "is_appendable": typ == "plain"},
                 "config": {"vector_data": {"v": {"storage_type": "Mmap", "index": index,
                                                  "quantization_config": {"scalar": {"type": "int8"}} if quant and typ != "plain" else None}},
@@ -770,7 +789,15 @@ if __name__ == "__main__":
     sa = segment_analysis([seg("p1", "plain", 8313, 0), seg("i1", "indexed", 785418, 835630, deleted=50212),
                            seg("i2", "indexed", 198075, 198075, m=16, quant=False)], seg_cfg)
     sm = [m_ for _, m_ in sa["findings"]]
-    assert sa["unindexed"] == 8313 and any("8,313 vectors" in x and "indexing_threshold=20,000" in x for x in sm), sm
+    assert sa["unindexed"] == 8313 and any("8,313 vectors" in x and "% of vectors" in x for x in sm), sm
+    assert not any("over indexing_threshold" in x for x in sm), sm
+    big = segment_analysis([seg("p2", "plain", 30000, 0)], seg_cfg)
+    assert any("p2" in x and "30,000 KiB" in x and "indexing_threshold=20,000 KiB" in x for _, x in big["findings"]), big["findings"]
+    nocfg = segment_analysis([seg("i3", "indexed", 10, 10, m=16)], {})
+    assert all(r["drift"] == [] for r in nocfg["rows"])
+    multi = segment_analysis([{"info": {"uuid": "x", "segment_type": "plain", "num_points": 1000, "num_vectors": 2000,
+                                        "num_indexed_vectors": 0}, "config": {}}], seg_cfg)
+    assert "100.0% of vectors" in multi["findings"][0][1], multi["findings"]
     assert any("1 segment(s) were built" in x and "m 16 (config 0)" in x for x in sm), sm
     assert sa["rows"][0]["uuid"] == "p1" and sa["rows"][0]["drift"] == []
     i2 = next(r for r in sa["rows"] if r["uuid"] == "i2")
