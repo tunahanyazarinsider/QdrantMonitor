@@ -136,7 +136,9 @@
 
 <!-- ── Tabs ── -->
 <div class="border-b border-[#1a2236] mb-6 flex gap-1 overflow-x-auto">
-  <button class="qd-tab tab-active" id="tab-btn-browse"
+  <button class="qd-tab tab-active" id="tab-btn-health"
+          onclick="switchTab('health')">Overview</button>
+  <button class="qd-tab" id="tab-btn-browse"
           onclick="switchTab('browse')">Browse</button>
   <button class="qd-tab" id="tab-btn-search-id"
           onclick="switchTab('search-id')">By ID</button>
@@ -146,12 +148,10 @@
           onclick="switchTab('vectorspace')">Vector Space</button>
   <button class="qd-tab" id="tab-btn-snapshots"
           onclick="switchTab('snapshots')">Snapshots</button>
-  <button class="qd-tab" id="tab-btn-health"
-          onclick="switchTab('health')">Health</button>
 </div>
 
 <!-- ── Tab: Browse ── -->
-<div id="tab-browse" class="tab-panel">
+<div id="tab-browse" class="tab-panel hidden">
   <!-- Controls -->
   <div class="flex flex-wrap items-end gap-3 mb-4">
     <div>
@@ -384,7 +384,7 @@
 </div>
 
 <!-- ── Tab: Health ── -->
-<div id="tab-health" class="tab-panel hidden">
+<div id="tab-health" class="tab-panel">
   <div class="flex items-center gap-3 mb-4">
     <button class="qd-btn-ghost text-xs py-1.5"
             hx-get="/api/{{ collection.name }}/health"
@@ -395,7 +395,7 @@
   </div>
   <div id="health-content"
        hx-get="/api/{{ collection.name }}/health"
-       hx-trigger="intersect once"
+       hx-trigger="load"
        hx-swap="innerHTML">
     <div class="flex flex-col items-center gap-3 py-16 text-xs text-[#7b8fb5]"><div class="qd-spinner"></div>Reading telemetry, shard state and facets…</div>
   </div>
